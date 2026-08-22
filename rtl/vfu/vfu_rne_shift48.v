@@ -30,41 +30,32 @@ module vfu_rne_shift48 (
     output wire signed [47:0] y_o
 );
 
-    reg        [47:0] sticky_mask_w;
-    reg signed [47:0] shifted_w;
-    reg               guardbit_w;
-    reg               shifted_lsb_w;
-    reg               increment_w;
-    reg               sticky_bit_w;
-    reg signed [47:0] rne_y;
+    wire               shift_valid_w;
+    wire        [5:0]  shamt_m1_w;
+    wire        [47:0] guard_mask_w;
+    wire        [47:0] sticky_mask_w;
+    wire signed [47:0] shifted_w;
+    wire               guardbit_w;
+    wire               sticky_bit_w;
+    wire               increment_w;
+    wire signed [47:0] rounded_w;
 
-    always @(*) begin
-        shifted_w     = 48'sd0;
-        sticky_mask_w = 48'd0;
-        guardbit_w    = 1'b0;
-        shifted_lsb_w = 1'b0;
-        increment_w   = 1'b0;
-        sticky_bit_w  = 1'b0;
-        rne_y          = 48'sd0;
+    assign shift_valid_w = (shamt_i != 6'd0) && (shamt_i < 6'd48);
+    assign shamt_m1_w     = shift_valid_w ? (shamt_i - 6'd1) : 6'd0;
 
-        if (shamt_i == 6'd0) begin
-            rne_y = x_i;
-        end else if (shamt_i < 6'd48) begin
-            shifted_w = $signed(x_i) >>> shamt_i;
+    // Example: shamt=4
+    // guard_mask  = 1 << 3 = 4'b1000, selecting x_i[3].
+    // sticky_mask = guard_mask - 1 = 3'b111, selecting x_i[2:0].
+    assign guard_mask_w  = shift_valid_w ? (48'd1 << shamt_m1_w) : 48'd0;
+    assign sticky_mask_w = shift_valid_w ? (guard_mask_w - 48'd1) : 48'd0;
 
-            guardbit_w = x_i[shamt_i - 6'd1];
+    assign shifted_w    = $signed(x_i) >>> shamt_i;
+    assign guardbit_w   = |(x_i & guard_mask_w);
+    assign sticky_bit_w = |(x_i & sticky_mask_w);
+    assign increment_w  = guardbit_w & (shifted_w[0] | sticky_bit_w);
+    assign rounded_w    = shifted_w + {{47{1'b0}}, increment_w};
 
-            // Example: shamt=4
-            // (1 << 3) - 1 = 3'b111, selecting x_i[2:0].
-            sticky_mask_w = (48'd1 << (shamt_i - 6'd1)) - 48'd1;
-            sticky_bit_w  = |(x_i & sticky_mask_w);
-
-            shifted_lsb_w = shifted_w[0];
-            increment_w   = guardbit_w & (shifted_lsb_w | sticky_bit_w);
-            rne_y          = shifted_w + {{47{1'b0}}, increment_w};
-        end
-    end
-
-    assign y_o = rne_y;
+    // shamt=0 naturally gives shifted_w=x_i and increment_w=0.
+    assign y_o = (shamt_i < 6'd48) ? rounded_w : 48'sd0;
 
 endmodule
