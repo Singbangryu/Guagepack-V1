@@ -5,7 +5,7 @@ module tb_vfu_post_alu_lane;
 
     reg [3:0] op_i;
     reg signed [47:0] p_i;
-    reg [5:0] shift_i;
+    reg [5:0] shamt_i;
     reg [1:0] range_i;
     reg [7:0] low_code_i;
     reg [7:0] high_code_i;
@@ -20,7 +20,7 @@ module tb_vfu_post_alu_lane;
     vfu_post_alu_lane dut (
         .op_i(op_i),
         .p_i(p_i),
-        .shift_i(shift_i),
+        .shamt_i(shamt_i),
         .range_i(range_i),
         .low_code_i(low_code_i),
         .high_code_i(high_code_i),
@@ -36,7 +36,7 @@ module tb_vfu_post_alu_lane;
         begin
             op_i = `VFU_OP_RQ;
             p_i = 48'sd0;
-            shift_i = 6'd0;
+            shamt_i = 6'd0;
             range_i = 2'b00;
             low_code_i = 8'd0;
             high_code_i = 8'd0;
@@ -51,8 +51,8 @@ module tb_vfu_post_alu_lane;
         begin
             #1;
             if ($signed(data_o) !== expected) begin
-                $display("FAIL op=%h p=%0d shift=%0d got=%0d expected=%0d",
-                         op_i, $signed(p_i), shift_i,
+                $display("FAIL op=%h p=%0d shamt=%0d got=%0d expected=%0d",
+                         op_i, $signed(p_i), shamt_i,
                          $signed(data_o), expected);
                 $fatal(1);
             end
@@ -64,7 +64,7 @@ module tb_vfu_post_alu_lane;
 
         // RNE ties-to-even: +2.5 -> +2, +3.5 -> +4
         op_i = `VFU_OP_RQ;
-        shift_i = 1;
+        shamt_i = 1;
 
         p_i = 5;
         expect_s32(2);
@@ -80,9 +80,12 @@ module tb_vfu_post_alu_lane;
         expect_s32(-4);
 
         // Narrow-S8 forbids -128.
-        shift_i = 0;
+        shamt_i = 0;
         p_i = -200;
         expect_s32(-127);
+
+        p_i = 200;
+        expect_s32(127);
 
         // RQ_RES: main8=100, skip=100 -> raw S9 200, no saturation.
         op_i = `VFU_OP_RQ_RES;
@@ -90,21 +93,94 @@ module tb_vfu_post_alu_lane;
         skip_i = 100;
         expect_s32(200);
 
-        // QEXP tail then mask.
-        op_i = `VFU_OP_QEXP;
+        // Residual extrema fit exact S9 without post-add saturation.
+        p_i = 127;
+        skip_i = 127;
+        expect_s32(254);
+
+        p_i = -127;
+        skip_i = -127;
+        expect_s32(-254);
+
+        // The main branch clamps before the residual addition.
+        p_i = 200;
+        skip_i = -100;
+        expect_s32(27);
+
+        // GELU tail codes bypass the middle RNE/clamp result.
+        defaults();
+        op_i = `VFU_OP_GELU;
+        range_i = 2'b01;
+        low_code_i = 8'hfb; // signed -5
+        expect_s32(-5);
+
         range_i = 2'b10;
-        high_code_i = 127;
+        high_code_i = 8'd100;
+        expect_s32(100);
+
+        // QEXP architectural tails are fixed to LOW=0 and HIGH=127.
+        defaults();
+        op_i = `VFU_OP_QEXP;
+        range_i = 2'b01;
+        low_code_i = 8'd99; // deliberately ignored
+        expect_s32(0);
+
+        range_i = 2'b10;
+        high_code_i = 8'd3; // deliberately ignored
         pair_valid_i = 1;
         expect_s32(127);
 
         pair_valid_i = 0;
         expect_s32(0);
 
+        // QEXP middle code clamps into U7.
+        defaults();
+        op_i = `VFU_OP_QEXP;
+        p_i = -1;
+        expect_s32(0);
+
+        p_i = 128;
+        expect_s32(127);
+
+        // Compiler contract for the d==0 middle endpoint.
+        p_i = 127;
+        expect_s32(127);
+
         // SM_RECIP semantic zero override.
         defaults();
         op_i = `VFU_OP_SM_RECIP_RAW;
-        shift_i = 8;
+        shamt_i = 8;
         p_i = 48'sd123456;
+        force_zero_i = 1;
+        expect_s32(0);
+
+        force_zero_i = 0;
+        expect_s32(482);
+
+        // Softmax context uses the fixed RNE >> 23 boundary.
+        defaults();
+        op_i = `VFU_OP_SM_CONTEXT;
+        shamt_i = 23;
+        p_i = 48'sd838860800; // 100 * 2^23
+        expect_s32(100);
+
+        // LN_D uses RNE >> 4 and keeps a U27 result.
+        defaults();
+        op_i = `VFU_OP_LN_D;
+        shamt_i = 4;
+        p_i = 48'sd1600;
+        expect_s32(100);
+
+        // LN_RSQRT middle code clamps into U8, then force_zero wins.
+        defaults();
+        op_i = `VFU_OP_LN_RSQRT;
+        p_i = 300;
+        expect_s32(255);
+
+        p_i = -1;
+        expect_s32(0);
+
+        p_i = 100;
         force_zero_i = 1;
         expect_s32(0);
 
@@ -112,8 +188,15 @@ module tb_vfu_post_alu_lane;
         defaults();
         op_i = `VFU_OP_LN_NORM;
         p_i = -48'sd123456;
-        shift_i = 31; // ignored
+        shamt_i = 31; // ignored
         expect_s32(-123456);
+
+        // Final LayerNorm affine boundary returns symmetric S8.
+        defaults();
+        op_i = `VFU_OP_LN_AFFINE;
+        shamt_i = 2;
+        p_i = -48'sd400;
+        expect_s32(-100);
 
         // Moment split: P=(S<<23)+Q.
         defaults();
