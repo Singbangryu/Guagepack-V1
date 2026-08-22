@@ -13,15 +13,6 @@
 //
 //     increment = guard & (sticky | shifted_lsb)
 //
-// Boundary behavior:
-//   shamt == 0  : exact bypass
-//   1..47       : normal signed RNE
-//   shamt >= 48 : result is zero; every S48 input has magnitude <= 0.5 LSB
-//                 at that output scale, and the sole exact tie (-2^47/2^48)
-//                 rounds to the even integer zero.
-//
-// No saturation or output narrowing is performed here. Those operations
-// belong to the following operator-specific S3 formatting logic.
 // =============================================================================
 
 module vfu_rne_shift48 (
@@ -55,7 +46,6 @@ module vfu_rne_shift48 (
     assign increment_w  = guardbit_w & (shifted_w[0] | sticky_bit_w);
     assign rounded_w    = shifted_w + {{47{1'b0}}, increment_w};
 
-    // shamt=0 naturally gives shifted_w=x_i and increment_w=0.
     assign y_o = (shamt_i < 6'd48) ? rounded_w : 48'sd0;
 
 endmodule
