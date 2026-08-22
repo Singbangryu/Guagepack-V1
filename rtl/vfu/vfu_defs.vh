@@ -14,4 +14,9 @@
 `define VFU_OP_LN_NORM         4'hA
 `define VFU_OP_LN_AFFINE       4'hB
 
+// Post-ALU activation clamp modes.
+`define VFU_CLAMP_S8_SYM       2'b00
+`define VFU_CLAMP_U7           2'b01
+`define VFU_CLAMP_U8           2'b10
+
 `endif
