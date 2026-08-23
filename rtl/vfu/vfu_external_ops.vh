@@ -4,14 +4,16 @@
 // =============================================================================
 // GaugePack VFU external operation contract
 // =============================================================================
-// Only these coarse operations are visible at the VFU boundary.  Detailed
-// micro-op encodings remain private to the VFU controller.  The comments below
-// describe the functional phases only; they are not externally issued opcodes.
+// Only these function-level operations are visible at the VFU boundary.
+// Detailed micro-op encodings remain private to the VFU controller.  The
+// comments below describe internal functional phases only; they are not
+// externally issued opcodes.
 //
-// VFU_NON_LINEAR_RQ
-//   - Generic requantization
-//   - GELU Direct32/Q-Map
-//   - Page/metadata selects the pointwise transform.
+// VFU_RQ
+//   - Generic requantization only
+//
+// VFU_GELU
+//   - GELU Direct32/Q-Map only
 //
 // VFU_SM
 //   - Rowmax ingest/reduction
@@ -33,13 +35,15 @@
 //   - Affine + final requantization
 //
 // Never route the internal micro-op field across the VFU boundary.
+// Encodings 3'b101 through 3'b111 are reserved.
 // =============================================================================
 
-`define VFU_EXTERNAL_OP_W       2
+`define VFU_EXTERNAL_OP_W       3
 
-`define VFU_NON_LINEAR_RQ       2'b00
-`define VFU_SM                  2'b01
-`define VFU_SM_NL               2'b10
-`define VFU_LN                  2'b11
+`define VFU_RQ                  3'b000
+`define VFU_GELU                3'b001
+`define VFU_SM                  3'b010
+`define VFU_SM_NL               3'b011
+`define VFU_LN                  3'b100
 
 `endif
