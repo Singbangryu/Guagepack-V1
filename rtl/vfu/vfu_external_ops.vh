@@ -2,43 +2,69 @@
 `define GAUGEPACK_VFU_EXTERNAL_OPS_VH
 
 // =============================================================================
-// GaugePack VFU external operation contract
+// GaugePack VFU TOP operation contract
 // =============================================================================
-// Only these function-level operations are visible at the VFU boundary.
-// Detailed micro-op encodings remain private to the VFU controller.  The
-// comments below describe internal functional phases only; they are not
-// externally issued opcodes.
+// "Internal ops are not exposed" is an RTL interface rule, not documentation
+// secrecy:
 //
+//   TOP -> VFU controller : VFU_TOP_OP_W-bit function-level op
+//   VFU controller -> CORE16/reduction blocks : private 4-bit VFU_OP_* micro-op
+//
+// TOP must never drive or observe the private 4-bit micro-op field.  The VFU
+// controller expands each TOP op into the internal sequence documented below.
+// Internal macro definitions and encodings remain in vfu_defs.vh.
+//
+// -----------------------------------------------------------------------------
 // VFU_RQ
-//   - Generic requantization only
+// -----------------------------------------------------------------------------
+// Internal CORE16 sequence:
+//   `VFU_OP_RQ
 //
+// -----------------------------------------------------------------------------
 // VFU_GELU
-//   - GELU Direct32/Q-Map only
+// -----------------------------------------------------------------------------
+// Internal CORE16 sequence:
+//   `VFU_OP_GELU
 //
+// -----------------------------------------------------------------------------
 // VFU_SM
-//   - Rowmax ingest/reduction
-//   - QEXP
-//   - Rowsum ingest/reduction
-//   - Reciprocal generation for L
+// -----------------------------------------------------------------------------
+// Internal controller sequence:
+//   1. ROWMAX reduction phase          (vfu_softmax state; no CORE16 micro-op)
+//   2. `VFU_OP_QEXP
+//   3. ROWSUM reduction phase          (vfu_softmax state; no CORE16 micro-op)
+//   4. `VFU_OP_SM_RECIP_RAW
 //
+// This operation ends after E, L, and reciprocal R are ready.  It does not
+// perform N/L because numerator N is produced later by the PMPU PV pass.
+//
+// -----------------------------------------------------------------------------
 // VFU_SM_NL
-//   - Terminal Softmax context apply after PMPU PV produces N
-//   - Computes context = N/L
-//   - Separate from VFU_SM because N is available much later.
+// -----------------------------------------------------------------------------
+// Issued only after PMPU PV has produced numerator N.
 //
+// Internal CORE16 sequence:
+//   `VFU_OP_SM_CONTEXT
+//
+// Arithmetic:
+//   context = N/L = RNE((N * R) >> 23)
+//
+// -----------------------------------------------------------------------------
 // VFU_LN
-//   - Main requantization + residual add
-//   - MomentPack statistics
-//   - D = 128Q - S^2
-//   - Reciprocal square root
-//   - Normalize
-//   - Affine + final requantization
+// -----------------------------------------------------------------------------
+// Internal controller sequence:
+//   1. `VFU_OP_RQ_RES
+//   2. `VFU_OP_LN_MOMENT_INIT
+//   3. `VFU_OP_LN_MOMENT_ACC          (repeat for remaining beats)
+//   4. `VFU_OP_LN_D
+//   5. `VFU_OP_LN_RSQRT
+//   6. `VFU_OP_LN_NORM
+//   7. `VFU_OP_LN_AFFINE
 //
-// Never route the internal micro-op field across the VFU boundary.
 // Encodings 3'b101 through 3'b111 are reserved.
 // =============================================================================
 
-`define VFU_EXTERNAL_OP_W       3
+`define VFU_TOP_OP_W            3
 
 `define VFU_RQ                  3'b000
 `define VFU_GELU                3'b001
