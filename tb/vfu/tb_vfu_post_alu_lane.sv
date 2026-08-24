@@ -9,7 +9,7 @@ module tb_vfu_post_alu_lane;
     reg [1:0] range_i;
     reg [7:0] low_code_i;
     reg [7:0] high_code_i;
-    reg pair_valid_i;
+    reg key_valid_i;
     reg force_zero_i;
     reg signed [7:0] skip_i;
 
@@ -24,7 +24,7 @@ module tb_vfu_post_alu_lane;
         .range_i(range_i),
         .low_code_i(low_code_i),
         .high_code_i(high_code_i),
-        .pair_valid_i(pair_valid_i),
+        .key_valid_i(key_valid_i),
         .force_zero_i(force_zero_i),
         .skip_i(skip_i),
         .data_o(data_o),
@@ -40,7 +40,7 @@ module tb_vfu_post_alu_lane;
             range_i = 2'b00;
             low_code_i = 8'd0;
             high_code_i = 8'd0;
-            pair_valid_i = 1'b1;
+            key_valid_i = 1'b1;
             force_zero_i = 1'b0;
             skip_i = 8'sd0;
         end
@@ -127,10 +127,10 @@ module tb_vfu_post_alu_lane;
 
         range_i = 2'b10;
         high_code_i = 8'd3; // deliberately ignored
-        pair_valid_i = 1;
+        key_valid_i = 1;
         expect_s32(127);
 
-        pair_valid_i = 0;
+        key_valid_i = 0;
         expect_s32(0);
 
         // QEXP middle code clamps into U7.
@@ -146,15 +146,20 @@ module tb_vfu_post_alu_lane;
         p_i = 127;
         expect_s32(127);
 
-        // SM_RECIP semantic zero override.
+        // The current key-valid bit masks every QEXP range, not only tails.
+        key_valid_i = 0;
+        expect_s32(0);
+
+        // SM reciprocal legal domain is L=127..8128.  force_zero belongs to
+        // LN_RSQRT only and must not override a Softmax reciprocal result.
         defaults();
         op_i = `VFU_OP_SM_RECIP_RAW;
         shamt_i = 8;
         p_i = 48'sd123456;
-        force_zero_i = 1;
-        expect_s32(0);
-
         force_zero_i = 0;
+        expect_s32(482);
+
+        force_zero_i = 1;
         expect_s32(482);
 
         // Softmax context uses the fixed RNE >> 23 boundary.

@@ -11,6 +11,13 @@ The resulting artifact is intended for the existing GaugePack E2E harness so
 that full_vfu_e7_* uses an actual E7 NN-LUT page instead of analytic semantic
 override.  It is a segment-local Direct32 *reference* page; final RTL M18/C48
 compilation/certification remains a separate compiler step.
+
+Scaled-attention contract
+-------------------------
+The integer input is the raw QK accumulator difference ``d_int``.  The scalar
+``score_scale_folded`` used by the analytic target is the complete
+``query_scale * key_scale / sqrt(head_dim)``.  Thus ``1/sqrt(head_dim)`` is
+compiled into the QEXP page; callers must not pre-scale ``d_int`` as well.
 """
 
 from __future__ import annotations
@@ -82,6 +89,7 @@ def qexp_zero_threshold(score_scale: float, qmax: int) -> int:
 
 
 def qexp_target(x: np.ndarray, score_scale: float, qmax: int = QMAX_E7) -> np.ndarray:
+    """Return RNE/clamped ``qmax*exp(d_int*score_scale_folded)`` codes."""
     x = np.asarray(x, dtype=np.int64)
     code = rne_float_to_int(float(qmax) * np.exp(x.astype(np.float64) * score_scale))
     return np.clip(code, 0, qmax).astype(np.int64)
@@ -422,6 +430,10 @@ def fit_layer_page(
     new_page["origin"] = origin.tolist()
     metadata["task"] = "softmax_qexp"
     metadata["score_scale_folded"] = score_scale
+    metadata["score_scale_definition"] = "query_scale*key_scale/sqrt(head_dim)"
+    metadata["qexp_input_domain"] = "raw_qk_accumulator_difference"
+    metadata["scaled_attention_fused"] = True
+    metadata["runtime_score_rescale"] = False
     metadata["analytic_zero_threshold_inclusive"] = int(zero_threshold)
     metadata["e7_build"] = {
         "method": "train-calibration weighted segment-local Direct32 refit",
@@ -441,6 +453,11 @@ def fit_layer_page(
     new_pipeline = copy.deepcopy(pipeline)
     new_pipeline["qexp_bits"] = 7
     new_pipeline["qexp_qmax"] = QMAX_E7
+    new_pipeline["score_scale_folded"] = score_scale
+    new_pipeline["score_scale_definition"] = "query_scale*key_scale/sqrt(head_dim)"
+    new_pipeline["qexp_input_domain"] = "raw_qk_accumulator_difference"
+    new_pipeline["scaled_attention_fused"] = True
+    new_pipeline["runtime_score_rescale"] = False
     new_pipeline["analytic_zero_threshold_inclusive"] = int(zero_threshold)
     new_pipeline["exp_lut_json"] = new_json.name
     new_pipeline["e7_qexp_reference_page"] = True
@@ -450,6 +467,10 @@ def fit_layer_page(
         "source_u8_page": str(page_path),
         "e7_page": str(new_json),
         "score_scale": score_scale,
+        "score_scale_definition": "query_scale*key_scale/sqrt(head_dim)",
+        "qexp_input_domain": "raw_qk_accumulator_difference",
+        "scaled_attention_fused": True,
+        "runtime_score_rescale": False,
         "zero_threshold_inclusive": int(zero_threshold),
         "x_min": x_min,
         "x_max": x_max,
@@ -689,6 +710,11 @@ def self_test() -> None:
             raise AssertionError(f"E7 artifact must contain exactly one QEXP page, got {qexp_json}")
         if list(soft_out.glob("nnlut_softmax_qexp_u8_direct32.*")):
             raise AssertionError("copied U8 QEXP payload survived E7 rebuild")
+        pipeline = read_json(soft_out / "softmax_pipeline.json")
+        if not pipeline.get("scaled_attention_fused", False):
+            raise AssertionError("QEXP pipeline lost scaled-attention fusion contract")
+        if pipeline.get("runtime_score_rescale") is not False:
+            raise AssertionError("QEXP pipeline must consume raw QK differences")
     print("SELF-TEST PASS: E7-only QEXP artifact, copied-U8 purge, train/search isolation, page/pipeline/summary rewrite")
 
 

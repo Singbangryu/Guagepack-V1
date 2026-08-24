@@ -2,7 +2,7 @@
 
 > **파일:** `VFU_Function_Frozen.md`  
 > **상태:** **FROZEN — VFU 산술/계산 그래프 기준 문서**  
-> **날짜:** 2026-08-21  
+> **날짜:** 2026-08-24
 > **범위:** GaugePack BERT-Tiny VFU — Requantization, GELU, Softmax, LayerNorm  
 > **상위 아키텍처 기준:** `GaugePack_VFU_Architecture_Frozen_v1.md`  
 > **목적:** 이 파일 하나만 읽고 VFU의 계산 그래프, CORE16 4-stage 동작, operand mapping, bitwidth, scale, RNE/SAT 위치, compiler 책임을 파악할 수 있게 한다.
@@ -323,16 +323,31 @@ high_code     : raw8, GELU에서는 S8 의미
 
 ## 7.1 수학적 변환
 
-원래 attention context는:
+원래 scaled-attention context는:
 
 ```text
-Softmax(score) × V
+Softmax((QK^T) / sqrt(H)) × V
 ```
+
+GaugePack v1의 `H=head_dim=64`이고, PMPU는 별도의 `1/sqrt(H)` 곱셈 없이
+raw integer dot-product를 출력한다.
+
+```text
+score_int    = Σ(q_code × k_code)
+s_score      = s_Q × s_K / sqrt(H)
+scaled_score ≈ score_int × s_score
+```
+
+`1/sqrt(H)`는 runtime RSQRT 연산이 아니라 compile-time 상수다. 이 상수와
+Q/K quantization scale을 합친 `s_score` 전체를 QEXP page의 계수에 fold한다.
+`H=64`라서 `1/sqrt(H)=1/8`이지만, QK 뒤에 별도 `>>3` stage를 두지 않는다.
+LayerNorm의 RSQRT page와도 무관하다.
 
 GaugePack v1은 explicit probability `E/L`를 materialize하지 않는다.
 
 ```text
-E_j ≈ exp(score_j-rowmax) 를 E7로 양자화
+d_int = score_int - rowmax_int
+E_j   ≈ exp(d_int × s_score) 를 E7로 양자화
 L   = Σ E_j
 N   = Σ E_j V_j
 context ≈ N / L
@@ -361,7 +376,7 @@ score:S24 ──────────────┐
          d=score-rowmax:S25
                   │
                   ▼
-          QEXP 16-seg PWL
+   QEXP 16-seg PWL (s_score fused)
                   │
                   ▼
              E7 [0,127]
@@ -394,26 +409,62 @@ score:S24 ──────────────┐
 ## 7.3 QK / rowmax
 
 ```text
-score  : S24
+score  : S24 raw QK integer accumulator
 rowmax : S24
 d      : score-rowmax = S25
 ```
 
 Invalid key는 rowmax 계산에서 제외한다.
 
+`s_score`는 positive constant이므로 raw integer score에서 rowmax를 구해도
+scaled score에서 구한 rowmax와 같은 key를 선택한다. 따라서 rowmax 앞에
+별도 scale 회로가 필요 없다.
+
+### Softmax mask / scheduling 계약
+
+GaugePack v1은 한 번에 16개 query row와 현재 key 하나의 score를 처리한다.
+
+```text
+command : key_mask[63:0]
+beat    : key_valid = key_mask[key_index]  (1 bit)
+lanes   : 같은 key_valid를 16개 query lane에 broadcast
+```
+
+16개 query lane은 모두 architectural active lane이다. 입력 tensor에 padding token
+위치가 있더라도 Softmax 안에서 invalid query lane으로 바꾸지 않고 계산한다.
+따라서 Softmax datapath에는 `query_valid`와 lane별 `pair_valid[15:0]`가 없다.
+
+Legal Softmax command는 valid key를 최소 하나 포함해야 한다.
+
+```text
+|key_mask[63:0]| != 0
+```
+
+GaugePack v1 BERT encoder는 causal/lane별 attention mask를 지원하지 않는다.
+masking은 key 축에만 적용한다.
+
 ## 7.4 QEXP
 
 ### 함수
 
 ```text
-pair_valid = query_valid && key_valid
-
-if !pair_valid : E = 0
+if !key_valid  : E = 0
 else if d == 0 : E = 127
-else           : E = QEXP_PWL(d)
+else           : E = QEXP_PWL(d; s_score fused)
 
 E ∈ [0,127]
 ```
+
+QEXP page의 analytic teacher/compile 목적함수는:
+
+```text
+E_ref(d) = clamp(RNE_even(127 × exp(d × s_score)), 0, 127)
+s_score  = s_Q × s_K / sqrt(head_dim)
+```
+
+이때 page metadata의 `score_scale_folded`는 반드시 위 `s_score` 전체를
+의미한다. PMPU/VFU에서 `d`를 미리 `1/sqrt(head_dim)`로 scale한 뒤
+이 page에 넣으면 attention scale이 두 번 적용되므로 금지한다.
 
 ### 4-stage
 
@@ -422,7 +473,7 @@ E ∈ [0,127]
 | S0 | `score:S24 - rowmax:S24 → d:S25`, segment select |
 | S1 | `A:S27=signext(d)`, `B:S18=M_e[seg]`, `C:S48=C_e[seg]` |
 | S2 | `P:S48=d×M_e+C_e` |
-| S3 | PWL decode → E7 clamp, invalid pair → 0, endpoint `d=0` → 127 |
+| S3 | PWL decode → E7 clamp, invalid key → 0, endpoint `d=0` → 127 |
 
 출력:
 
@@ -436,16 +487,24 @@ physical   : 8-bit byte, bit7=0
 Sequence length `<=64`:
 
 ```text
-L = ΣE
+L = Σ E_j  (valid key만 포함; invalid key의 E_j=0)
 L_max = 64 × 127 = 8128
+```
+
+Legal command에는 valid key가 하나 이상 있다. 각 query row의 rowmax 위치는
+`d=0`이고 QEXP endpoint가 정확히 `E=127`이므로 모든 query lane에서:
+
+```text
+L_min = 127
+L_max = 8128
 ```
 
 따라서:
 
 ```text
 L : U13
-active legal domain : 127 ... 8128
-padding query       : L=0 가능
+legal domain : 127 ... 8128
+L=0          : illegal command/state
 ```
 
 ## 7.6 RAW reciprocal
@@ -490,7 +549,7 @@ R   : positive S18
 | S0 | `L:U13`, segment select |
 | S1 | `A:S27=L`, `B:S18=M_r`, `C:S48=C_r` |
 | S2 | `P_r:S48` |
-| S3 | `RNE(P_r>>8)` → positive `R:S18`, `L=0` → 0 |
+| S3 | `RNE(P_r>>8)` → positive `R:S18` |
 
 ## 7.7 PV numerator
 
@@ -1034,7 +1093,7 @@ y8        : S8 [-127,127]
 | RQ_RES DSP | main S32 | `main×M_RQ+C_RQ` | P48 → main8:S8 | main branch requant |
 | RQ_RES POST | main8:S8 + original skip:S8 | exact add | z:S9 | residual/LN input |
 | GELU | S32/A27-safe | 16-seg PWL | S8 | terminal GELU code |
-| QEXP | d:S25 | 16-seg PWL | E7 | unnormalized exp code |
+| QEXP | raw d:S25 | 16-seg PWL, `s_Q×s_K/sqrt(H)` fused | E7 | unnormalized scaled-exp code |
 | SM reciprocal | L:U13 | 16-seg raw PWL | positive S18 | `≈2^23/L` |
 | SM context | N:S21 + R:S18 | multiply | S8 | `N/L`, scale=s_V |
 | LN Moment | z:S9 | G23 P-feedback | S16 + U23 | S/Q |
@@ -1115,9 +1174,10 @@ DSP contract = A27 / B18 / C48 / P48
 NARROW_S8 = [-127,127]
 
 Softmax:
-score S24
+score S24 raw QK accumulator
 rowmax S24
 d S25
+QEXP score scale = s_Q × s_K / sqrt(head_dim), page-folded
 E7 [0,127]
 L U13
 N S21
@@ -1169,6 +1229,12 @@ GELU/QEXP/RSQRT page:
   C[16]
   shift
   low_code/high_code
+
+QEXP site:
+  head_dim
+  s_score = s_Q × s_K / sqrt(head_dim)
+  metadata.score_scale_folded = s_score
+  input domain = raw d_int (runtime rescale 없음)
 
 Softmax reciprocal:
   fixed raw-v1 boundaries/M/C
@@ -1224,6 +1290,8 @@ Vsum correction
 explicit probability E/L tensor
 PV intermediate requant
 raw-v2 calibrated reciprocal as baseline
+separate runtime score × 1/sqrt(head_dim) stage
+QEXP에 fold된 attention scale의 중복 적용
 ```
 
 ---
@@ -1256,7 +1324,7 @@ operator-specific POST
 ## 14.2 Softmax
 
 ```text
-QK S24
+QK raw S24  (s_Q×s_K/sqrt(H)는 QEXP page에 fold)
   ↓ rowmax S24
 score-rowmax S25
   ↓
@@ -1368,7 +1436,7 @@ GELU
 S32/A27 → PWL M18/C48 → P48 → terminal S8
 
 SOFTMAX
-score S24
+score raw S24  [QEXP에 s_Q×s_K/sqrt(H) fold]
 rowmax S24
   ↓
 d S25 → QEXP → E7
@@ -1408,4 +1476,3 @@ reduction / metadata state
 특히 가장 중요한 설계 규칙은 다음이다.
 
 > **산술 의미를 바꾸는 shift, RNE, SAT, residual add를 구현 세부사항 속에 숨기지 않는다. 계산 그래프에 반드시 stage와 함께 명시한다.**
-

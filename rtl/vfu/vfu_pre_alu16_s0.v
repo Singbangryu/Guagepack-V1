@@ -169,6 +169,9 @@ LN_AFFINE             PRE.A = T                M_gamma[feature]          C_beta[
 
             PRE_QEXP: begin
                 // d = score - rowmax, S25 semantic.
+                // d stays in the raw QK integer domain.  The selected QEXP
+                // page M/C already folds s_Q*s_K/sqrt(head_dim); do not add
+                // a runtime >>3 for the BERT-Tiny head_dim=64 case.
                 a_o     = {{2{sub_y_w[24]}}, sub_y_w};
                 seg_x_w = {{7{sub_y_w[24]}}, sub_y_w};
             end

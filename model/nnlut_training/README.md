@@ -7,7 +7,7 @@
 | 파일 | frozen 입출력 계약 | 생성 방식 |
 |---|---|---|
 | `gaugepack_gelu_nnlut_train.py` | FFN1 raw accumulator+bias → terminal `S8 [-127,127]` | calibration 학습형 continuous PWL; M18/C48 compile 전 reference |
-| `gaugepack_qexp_nnlut_train.py` | `d=score-rowmax:S25` → `E7 [0,127]` | 기존 U8 artifact의 boundary를 유지하고 calibration trace로 E7 segment-local Direct32 refit |
+| `gaugepack_qexp_nnlut_train.py` | raw `d_int=score_int-rowmax_int:S25` → `E7 [0,127]` | `s_Q×s_K/sqrt(head_dim)`을 QEXP 계수에 fold하고, 기존 U8 boundary/calibration trace로 E7 segment-local Direct32 refit |
 | `gaugepack_softmax_recip_nnlut_train.py` | `L:U13 [127,8128]` → `R≈2^23/L`, `RNE>>8` | frozen geometric relative-minimax + M18/C48 integer search + 전 legal-domain certificate |
 | `gaugepack_rsqrt_nnlut_train.py` | `D27=RNE((128Q-S²)>>4)` → `rho:U8` | calibration 학습형 continuous PWL; M18/C48 compile 전 reference |
 | `gaugepack_all_nnlut_train.py` | 위 네 실행 파일의 공통 진입점 | 단일 op forwarding, 전체 self-test, ordered JSON plan |
@@ -21,6 +21,9 @@
 - RSQRT 입력은 full `D`가 아니라 `D27=RNE_even(D/16)`이다.
 - QEXP는 현재 실제 E7 artifact flow라서 source U8 artifact 안의 calibration/search
   trace와 boundary를 사용한다.
+- QEXP input은 scale하지 않은 raw QK difference code다. Artifact의
+  `score_scale_folded = query_scale×key_scale/sqrt(head_dim)`이 scaled-attention을
+  이미 포함하므로 runtime에서 `1/sqrt(head_dim)`을 다시 적용하지 않는다.
 - reciprocal은 gradient training 대상이 아니라 frozen analytic/minimax compiler다.
 
 ## 빠른 검증

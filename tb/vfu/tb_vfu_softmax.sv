@@ -1,5 +1,12 @@
 `timescale 1ns/1ps
 
+// GaugePack Softmax reduction tests for the key-only masking contract.
+//
+// One input beat is one key column across all 16 query rows.  key_valid_i is
+// therefore a scalar shared by every row.  QEXP is the only owner of key
+// masking, so rowsum receives final E7 bytes and simply accumulates all lanes.
+// A legal command has at least one valid key; L=0 is not tested as a legal
+// result.
 module tb_vfu_softmax;
     reg clk_i;
     reg rst_ni = 1'b0;
@@ -8,32 +15,29 @@ module tb_vfu_softmax;
     reg rowmax_valid_i = 1'b0;
     reg rowmax_clear_i = 1'b0;
     reg rowmax_last_i = 1'b0;
-    reg [15:0] score_lane_valid_i = 16'd0;
+    reg key_valid_i = 1'b0;
     reg [383:0] score_i = 384'd0;
 
     wire rowmax_done_o;
     wire [383:0] rowmax_o;
-    wire [15:0] rowmax_has_valid_o;
 
     reg rowsum_valid_i = 1'b0;
     reg rowsum_clear_i = 1'b0;
     reg rowsum_last_i = 1'b0;
-    reg [15:0] e_lane_valid_i = 16'd0;
     reg [127:0] e_i = 128'd0;
 
     wire rowsum_done_o;
     wire [207:0] rowsum_o;
-    wire [15:0] rowsum_zero_o;
 
     integer key;
     integer lane;
     integer errors = 0;
-    integer expected_max [0:15];
-    integer expected_sum [0:15];
-    reg [15:0] expected_has_valid;
-    reg [15:0] beat_mask;
     integer score_value;
     integer e_value;
+    integer expected_max [0:15];
+    integer expected_sum [0:15];
+    reg [383:0] held_rowmax;
+    reg [207:0] held_rowsum;
 
     initial clk_i = 1'b0;
     always #5 clk_i = ~clk_i;
@@ -46,63 +50,57 @@ module tb_vfu_softmax;
         .rowmax_valid_i(rowmax_valid_i),
         .rowmax_clear_i(rowmax_clear_i),
         .rowmax_last_i(rowmax_last_i),
-        .score_lane_valid_i(score_lane_valid_i),
+        .key_valid_i(key_valid_i),
         .score_i(score_i),
         .rowmax_done_o(rowmax_done_o),
         .rowmax_o(rowmax_o),
-        .rowmax_has_valid_o(rowmax_has_valid_o),
 
         .rowsum_valid_i(rowsum_valid_i),
         .rowsum_clear_i(rowsum_clear_i),
         .rowsum_last_i(rowsum_last_i),
-        .e_lane_valid_i(e_lane_valid_i),
         .e_i(e_i),
         .rowsum_done_o(rowsum_done_o),
-        .rowsum_o(rowsum_o),
-        .rowsum_zero_o(rowsum_zero_o)
+        .rowsum_o(rowsum_o)
     );
 
     task automatic send_score(
         input bit clear,
         input bit last,
-        input logic [15:0] mask
+        input bit key_valid
     );
         begin
             @(negedge clk_i);
             rowmax_valid_i = 1'b1;
             rowmax_clear_i = clear;
             rowmax_last_i = last;
-            score_lane_valid_i = mask;
+            key_valid_i = key_valid;
             @(posedge clk_i);
             #1;
             rowmax_valid_i = 1'b0;
             rowmax_clear_i = 1'b0;
             rowmax_last_i = 1'b0;
-            score_lane_valid_i = 16'd0;
+            key_valid_i = 1'b0;
         end
     endtask
 
     task automatic send_e(
         input bit clear,
-        input bit last,
-        input logic [15:0] mask
+        input bit last
     );
         begin
             @(negedge clk_i);
             rowsum_valid_i = 1'b1;
             rowsum_clear_i = clear;
             rowsum_last_i = last;
-            e_lane_valid_i = mask;
             @(posedge clk_i);
             #1;
             rowsum_valid_i = 1'b0;
             rowsum_clear_i = 1'b0;
             rowsum_last_i = 1'b0;
-            e_lane_valid_i = 16'd0;
         end
     endtask
 
-    task automatic check_rowmax_group;
+    task automatic check_rowmax;
         begin
             if (!rowmax_done_o) begin
                 $display("FAIL ROWMAX done missing on accepted last beat");
@@ -110,16 +108,8 @@ module tb_vfu_softmax;
             end
 
             for (lane = 0; lane < 16; lane = lane + 1) begin
-                if (rowmax_has_valid_o[lane] !== expected_has_valid[lane]) begin
-                    $display("FAIL ROWMAX lane=%0d has_valid=%b expected=%b",
-                             lane, rowmax_has_valid_o[lane],
-                             expected_has_valid[lane]);
-                    errors = errors + 1;
-                end
-
-                if ($signed({{8{rowmax_o[lane*24 + 23]}},
-                              rowmax_o[lane*24 +: 24]})
-                    !== expected_max[lane]) begin
+                if ($signed(rowmax_o[lane*24 +: 24])
+                    != expected_max[lane]) begin
                     $display("FAIL ROWMAX lane=%0d got=%0d expected=%0d",
                              lane, $signed(rowmax_o[lane*24 +: 24]),
                              expected_max[lane]);
@@ -129,7 +119,7 @@ module tb_vfu_softmax;
         end
     endtask
 
-    task automatic check_rowsum_group;
+    task automatic check_rowsum;
         begin
             if (!rowsum_done_o) begin
                 $display("FAIL ROWSUM done missing on accepted last beat");
@@ -137,18 +127,16 @@ module tb_vfu_softmax;
             end
 
             for (lane = 0; lane < 16; lane = lane + 1) begin
-                if ({19'd0, rowsum_o[lane*13 +: 13]}
-                    !== expected_sum[lane]) begin
+                if (rowsum_o[lane*13 +: 13] != expected_sum[lane]) begin
                     $display("FAIL ROWSUM lane=%0d got=%0d expected=%0d",
                              lane, rowsum_o[lane*13 +: 13],
                              expected_sum[lane]);
                     errors = errors + 1;
                 end
-
-                if (rowsum_zero_o[lane] !== (expected_sum[lane] == 0)) begin
-                    $display("FAIL ROWSUM lane=%0d zero=%b expected=%b",
-                             lane, rowsum_zero_o[lane],
-                             (expected_sum[lane] == 0));
+                if ((expected_sum[lane] < 127)
+                    || (expected_sum[lane] > 8128)) begin
+                    $display("FAIL testbench generated illegal L lane=%0d L=%0d",
+                             lane, expected_sum[lane]);
                     errors = errors + 1;
                 end
             end
@@ -160,95 +148,81 @@ module tb_vfu_softmax;
         @(negedge clk_i);
         rst_ni = 1'b1;
 
-        // ---------------------------------------------------------------------
-        // ROWMAX: one score-scratch word per key, 16 independent query rows.
-        // Keys 48..63 are padding. Query lane 15 is an all-masked query.
-        // ---------------------------------------------------------------------
-        expected_has_valid = 16'd0;
+        // ------------------------------------------------------------------
+        // ROWMAX: keys 48..63 are padding, shared by all query rows.  The
+        // invalid key 50 contains a huge score and must affect no row.
+        // ------------------------------------------------------------------
         for (lane = 0; lane < 16; lane = lane + 1)
-            expected_max[lane] = 0;
+            expected_max[lane] = -8388608;
 
         for (key = 0; key < 64; key = key + 1) begin
             score_i = 384'd0;
-            beat_mask = 16'd0;
-
             for (lane = 0; lane < 16; lane = lane + 1) begin
-                // Different maxima per query lane. Lane 3 has an invalid +max
-                // payload at key 50 to prove that padding never participates.
-                score_value = (key * (lane + 1)) - (lane * 37) - 500;
-                if ((lane == 3) && (key == 50))
-                    score_value = 8388607;
+                score_value = key * (lane + 1) - lane * 37 - 500;
+                if (key == 50)
+                    score_value = 8388607 - lane;
+                score_i[lane*24 +: 24] = score_value[23:0];
 
-                score_i[lane*24 +: 24] =
-                    $unsigned(24'(score_value));
-
-                if ((key < 48) && (lane != 15)) begin
-                    beat_mask[lane] = 1'b1;
-                    if (!expected_has_valid[lane]
-                        || (score_value > expected_max[lane])) begin
-                        expected_max[lane] = score_value;
-                    end
-                    expected_has_valid[lane] = 1'b1;
-                end
+                if ((key < 48) && (score_value > expected_max[lane]))
+                    expected_max[lane] = score_value;
             end
-
-            send_score(key == 0, key == 63, beat_mask);
+            send_score(key == 0, key == 63, key < 48);
         end
-        check_rowmax_group();
+        check_rowmax();
 
-        // Back-to-back single-key groups overwrite all 16 states on clear.
+        // done is one accepted-cycle pulse.
+        @(posedge clk_i);
+        #1;
+        if (rowmax_done_o) begin
+            $display("FAIL ROWMAX done did not retire");
+            errors = errors + 1;
+        end
+
+        // S24_MIN is a legal maximum.  No has-valid sideband is required.
+        score_i = {16{24'h800000}};
+        for (lane = 0; lane < 16; lane = lane + 1)
+            expected_max[lane] = -8388608;
+        send_score(1'b1, 1'b1, 1'b1);
+        check_rowmax();
+
+        // A legal mask need not start at key 0.  An invalid clear beat leaves
+        // the S24_MIN identity, and the first later valid key defines rowmax.
+        @(posedge clk_i);
+        #1;
+        score_i = {16{24'h7fffff}}; // ignored payload
+        send_score(1'b1, 1'b0, 1'b0);
+
         score_i = 384'd0;
-        expected_has_valid = 16'hffff;
         for (lane = 0; lane < 16; lane = lane + 1) begin
             score_value = lane - 100;
-            score_i[lane*24 +: 24] = $unsigned(24'(score_value));
+            score_i[lane*24 +: 24] = score_value[23:0];
             expected_max[lane] = score_value;
         end
-        send_score(1'b1, 1'b1, 16'hffff);
-        check_rowmax_group();
+        send_score(1'b0, 1'b1, 1'b1);
+        check_rowmax();
 
-        score_i = 384'd0;
-        expected_has_valid = 16'h7fff;
-        for (lane = 0; lane < 16; lane = lane + 1) begin
-            score_value = 1000 - lane;
-            score_i[lane*24 +: 24] = $unsigned(24'(score_value));
-            expected_max[lane] = (lane == 15) ? 0 : score_value;
-        end
-        send_score(1'b1, 1'b1, 16'h7fff);
-        check_rowmax_group();
-
-        // Minimum S24 is a valid value, distinct from an invalid lane.
-        score_i = 384'd0;
-        score_i[23:0] = 24'h800000;
-        expected_has_valid = 16'h0001;
-        for (lane = 0; lane < 16; lane = lane + 1)
-            expected_max[lane] = 0;
-        expected_max[0] = -8388608;
-        send_score(1'b1, 1'b1, 16'h0001);
-        check_rowmax_group();
-
-        // CE stall: held input is neither stored nor accumulated until accept.
-        @(posedge clk_i); // retire previous done
+        // CE stall: an asserted valid/last beat must not be accepted until CE.
+        @(posedge clk_i);
         #1;
         score_i = 384'd0;
-        expected_has_valid = 16'hffff;
         for (lane = 0; lane < 16; lane = lane + 1) begin
             score_value = lane + 77;
-            score_i[lane*24 +: 24] = $unsigned(24'(score_value));
+            score_i[lane*24 +: 24] = score_value[23:0];
             expected_max[lane] = score_value;
         end
+        held_rowmax = rowmax_o;
 
         @(negedge clk_i);
         ce_i = 1'b0;
         rowmax_valid_i = 1'b1;
         rowmax_clear_i = 1'b1;
         rowmax_last_i = 1'b1;
-        score_lane_valid_i = 16'hffff;
+        key_valid_i = 1'b1;
         repeat (2) begin
             @(posedge clk_i);
             #1;
-            if (rowmax_done_o) begin
-                $display("FAIL ROWMAX done changed during CE stall");
+            if ((rowmax_o !== held_rowmax) || rowmax_done_o) begin
+                $display("FAIL ROWMAX state changed during CE stall");
                 errors = errors + 1;
             end
         end
@@ -259,51 +233,86 @@ module tb_vfu_softmax;
         rowmax_valid_i = 1'b0;
         rowmax_clear_i = 1'b0;
         rowmax_last_i = 1'b0;
-        score_lane_valid_i = 16'd0;
-        check_rowmax_group();
+        key_valid_i = 1'b0;
+        check_rowmax();
 
-        // ---------------------------------------------------------------------
-        // ROWSUM: 64 key beats, 16 independent U13 sums.
-        // lane0 reaches the exact worst-case 64*127 = 8128.
-        // lane15 remains an all-masked/padding query with L=0.
-        // ---------------------------------------------------------------------
+        // ------------------------------------------------------------------
+        // ROWSUM 1: one valid key.  QEXP must emit E=127 at rowmax and zero
+        // on all 63 masked keys, so every legal query row has exactly L=127.
+        // ------------------------------------------------------------------
+        for (lane = 0; lane < 16; lane = lane + 1)
+            expected_sum[lane] = 127;
+
+        for (key = 0; key < 64; key = key + 1) begin
+            e_i = 128'd0;
+            if (key == 23)
+                e_i = {16{8'd127}};
+            send_e(key == 0, key == 63);
+        end
+        check_rowsum();
+
+        // ------------------------------------------------------------------
+        // ROWSUM 2: mixed shared key mask.  Masking already happened in QEXP;
+        // this block sees zero E bytes for invalid key beats.  Key 0 is the
+        // rowmax position and supplies E=127 to every row.
+        // ------------------------------------------------------------------
         for (lane = 0; lane < 16; lane = lane + 1)
             expected_sum[lane] = 0;
 
         for (key = 0; key < 64; key = key + 1) begin
             e_i = 128'd0;
-            beat_mask = 16'd0;
-
-            for (lane = 0; lane < 16; lane = lane + 1) begin
-                if (lane == 0)
-                    e_value = 127;
-                else if (lane == 1)
-                    e_value = key;
-                else if (lane == 2)
-                    e_value = 100;
-                else
-                    e_value = (key + lane) & 127;
-
-                e_i[lane*8 +: 8] = {1'b0, e_value[6:0]};
-
-                if ((lane != 15) && ((lane != 2) || (key < 10))) begin
-                    beat_mask[lane] = 1'b1;
+            if ((key < 48) && ((key % 5) != 1)) begin
+                for (lane = 0; lane < 16; lane = lane + 1) begin
+                    if (key == 0)
+                        e_value = 127;
+                    else
+                        e_value = (key + lane) & 7'h7f;
+                    e_i[lane*8 +: 8] = {1'b0, e_value[6:0]};
                     expected_sum[lane] = expected_sum[lane] + e_value;
                 end
             end
 
-            send_e(key == 0, key == 63, beat_mask);
+            // Hold one ordinary E beat across a two-cycle CE stall.
+            if (key == 17) begin
+                held_rowsum = rowsum_o;
+                @(negedge clk_i);
+                ce_i = 1'b0;
+                rowsum_valid_i = 1'b1;
+                rowsum_clear_i = 1'b0;
+                rowsum_last_i = 1'b0;
+                repeat (2) begin
+                    @(posedge clk_i);
+                    #1;
+                    if ((rowsum_o !== held_rowsum) || rowsum_done_o) begin
+                        $display("FAIL ROWSUM state changed during CE stall");
+                        errors = errors + 1;
+                    end
+                end
+                @(negedge clk_i);
+                ce_i = 1'b1;
+                @(posedge clk_i);
+                #1;
+                rowsum_valid_i = 1'b0;
+            end else begin
+                send_e(key == 0, key == 63);
+            end
         end
-        check_rowsum_group();
+        check_rowsum();
 
-        if (expected_sum[0] !== 8128 || expected_sum[1] !== 2016
-            || expected_sum[2] !== 1000 || expected_sum[15] !== 0) begin
-            $display("FAIL testbench ROWSUM reference constants");
-            errors = errors + 1;
+        // ------------------------------------------------------------------
+        // ROWSUM 3: exact U13 upper bound, 64 * E7_MAX = 8128.
+        // ------------------------------------------------------------------
+        for (lane = 0; lane < 16; lane = lane + 1)
+            expected_sum[lane] = 8128;
+
+        for (key = 0; key < 64; key = key + 1) begin
+            e_i = {16{8'd127}};
+            send_e(key == 0, key == 63);
         end
+        check_rowsum();
 
         if (errors == 0)
-            $display("PASS: vfu_softmax 16-lane rowmax/rowsum tests");
+            $display("PASS: vfu_softmax key-only mask contract");
         else
             $display("FAIL: vfu_softmax errors=%0d", errors);
 

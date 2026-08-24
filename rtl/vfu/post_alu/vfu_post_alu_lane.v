@@ -30,10 +30,12 @@ module vfu_post_alu_lane (
     input  wire [7:0]              low_code_i,
     input  wire [7:0]              high_code_i,
 
-    // Invalid/masked QEXP pair -> zero.
-    input  wire                    pair_valid_i,
+    // Scalar validity of the current key.  The 16-lane wrapper broadcasts the
+    // same bit to every query lane.  Used only by QEXP: invalid key -> E=0.
+    input  wire                    key_valid_i,
 
-    // Semantic zero override for SM_RECIP_RAW (L=0) and LN_RSQRT (D=0).
+    // Semantic zero override used only by LN_RSQRT (D=0).
+    // Softmax reciprocal has no L=0 architectural state.
     input  wire                    force_zero_i,
 
     // Used only by RQ_RES; already in the same scale as quantized main8.
@@ -126,14 +128,13 @@ module vfu_post_alu_lane (
             end
 
             `VFU_OP_QEXP: begin
-                data_o = pair_valid_i ? {24'd0, qexp_code_w} : 32'd0;
+                data_o = key_valid_i ? {24'd0, qexp_code_w} : 32'd0;
             end
 
             `VFU_OP_SM_RECIP_RAW: begin
+                // Legal L is U13 [127,8128], so L=0 needs no override path.
                 // Positive S18 by range certificate; preserve signed format.
-                data_o = force_zero_i
-                       ? 32'd0
-                       : {{14{rounded_w[17]}}, rounded_w[17:0]};
+                data_o = {{14{rounded_w[17]}}, rounded_w[17:0]};
             end
 
             `VFU_OP_SM_CONTEXT: begin

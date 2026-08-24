@@ -22,13 +22,18 @@ PMPU / matrix side
 VFU / nonlinear side
   * GELU: calibrated 16-segment NN-LUT/PWL page.
   * Softmax FINAL:
-        score = Q @ K^T
-        d = score - rowmax
-        E = E7 QEXP page, E in [0,127]
+        score_int = Q_code @ K_code^T
+        score_scale_folded = s_Q*s_K/sqrt(head_dim)
+        key_valid = key_mask[key_index], shared by every query lane
+        d_int = score_int - rowmax_int over valid keys
+        E = E7 QEXP page for 127*exp(d_int*score_scale_folded), E in [0,127]
         L = sum(E)
         R ~= 2^23/L using frozen raw geometric 16-segment minimax v1
         N = E @ V
         context = narrow_s8(RNE_even(N*R / 2^23))
+    The scaled-attention factor 1/sqrt(head_dim) is a compile-time constant
+    folded into the QEXP page together with the Q/K quantization scales.  The
+    raw integer QK score is therefore not rescaled before rowmax/QEXP.
     No U8 XOR/Vsum bridge, no exact divider, no CLZ normalization.
   * LayerNorm FINAL:
         skip remains in its native S8 scale
@@ -124,6 +129,8 @@ MOMENT_GAP = 23
 MOMENT_BASE = 1 << MOMENT_GAP
 D_SHIFT = 4
 SOFTMAX_RECIP_FRAC = 23
+SOFTMAX_L_MIN = 127
+SOFTMAX_L_MAX = 64 * 127
 
 # Softmax FINAL raw geometric minimax reciprocal v1.
 # R ~= 2^23 / L.  PWL equation: R = RNE((L*M[seg] + C[seg]) / 2^8)
@@ -382,6 +389,17 @@ class BaseArtifacts:
             )
             if not math.isclose(score_scale, derived, rel_tol=1e-8):
                 raise ValueError(f"layer {layer}: attention score scale mismatch")
+            try:
+                page_score_scale = float(qp.metadata["score_scale_folded"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"layer {layer}: QEXP page lacks numeric score_scale_folded"
+                ) from exc
+            if not math.isclose(page_score_scale, derived, rel_tol=1e-8):
+                raise ValueError(
+                    f"layer {layer}: QEXP page score_scale_folded does not equal "
+                    "query_scale*key_scale/sqrt(head_dim)"
+                )
             attention[layer] = AttentionArtifact(
                 layer=layer,
                 query_scale=float(arow["query_scale"]),
@@ -554,19 +572,16 @@ class LNArtifacts:
 
 
 def raw_reciprocal_v1(rowsum: torch.Tensor) -> torch.Tensor:
-    """FINAL no-CLZ reciprocal: R ~= 2^23/L, positive S18 for active rows."""
+    """FINAL no-CLZ reciprocal for the legal L domain 127..8128."""
     l = rowsum.to(torch.int64)
-    active = l > 0
-    # Invalid/padding rows may have L=0.  They are architectural mask cases,
-    # not a reciprocal zero-detection datapath.
-    safe = torch.where(active, l, torch.full_like(l, 127))
+    if bool(torch.any((l < SOFTMAX_L_MIN) | (l > SOFTMAX_L_MAX)).item()):
+        raise ValueError("Softmax rowsum must be in the legal U13 domain 127..8128")
     boundaries = torch.as_tensor(RAW_RECIP_BOUNDARIES, dtype=torch.int64, device=l.device)
     m = torch.as_tensor(RAW_RECIP_M, dtype=torch.int64, device=l.device)
     c = torch.as_tensor(RAW_RECIP_C, dtype=torch.int64, device=l.device)
-    seg = torch.bucketize(safe, boundaries, right=True)
-    p = safe * m[seg] + c[seg]
+    seg = torch.bucketize(l, boundaries, right=True)
+    p = l * m[seg] + c[seg]
     r = round_shift_rne(p, RAW_RECIP_COEF_SHIFT)
-    r = torch.where(active, r, torch.zeros_like(r))
     if bool(torch.any((r < 0) | (r > 131071)).item()):
         raise AssertionError("raw reciprocal escaped positive S18")
     return r
@@ -579,7 +594,12 @@ def frozen_softmax_context(
     attention_mask: torch.Tensor,
     art: AttentionArtifact,
 ) -> torch.Tensor:
-    """FINAL E7 QEXP + deferred PV + raw reciprocal v1."""
+    """FINAL scaled, key-only-masked E7 QEXP + deferred PV + raw reciprocal.
+
+    ``art.page`` consumes the raw integer difference ``d``.  Its coefficients
+    already implement ``exp(d * s_Q*s_K/sqrt(head_dim))``; applying an extra
+    score shift/multiply here would double-apply scaled-attention.
+    """
     q = quantize_narrow_s8(query_real, art.query_scale)
     k = quantize_narrow_s8(key_real, art.key_scale)
     v = quantize_narrow_s8(value_real, art.value_scale)
@@ -592,16 +612,23 @@ def frozen_softmax_context(
         return x.reshape(bsz, tokens, HEADS, HEAD_DIM).permute(0, 2, 1, 3)
 
     qh, kh, vh = heads(q), heads(k), heads(v)
+    # Raw integer QK accumulator.  Do not multiply/shift by 1/sqrt(head_dim):
+    # that factor is already part of the QEXP page's score_scale_folded.
     score = exact_small_matmul(
         qh, kh.transpose(-1, -2), reduction=HEAD_DIM, max_term=127 * 127
     )
 
-    valid_token = attention_mask.to(torch.bool)
-    pair_valid = (
-        valid_token[:, None, :, None]
-        & valid_token[:, None, None, :]
-    )
-    key_valid = valid_token[:, None, None, :]
+    key_mask = attention_mask.to(torch.bool)
+    if tuple(key_mask.shape) != (bsz, tokens):
+        raise ValueError("attention_mask must have shape [batch,tokens]")
+    if bool(torch.any(~key_mask.any(dim=-1)).item()):
+        raise ValueError("legal Softmax command requires at least one valid key")
+
+    # BERT padding mask applies to the key axis only.  For one PMPU key beat,
+    # key_mask[:, key_index] is one bit broadcast to all query lanes.  Padding
+    # token positions on the query axis are still computed; there is no
+    # query_valid/pair_valid lane sideband in GaugePack v1.
+    key_valid = key_mask[:, None, None, :]
     masked = torch.where(key_valid, score, torch.full_like(score, -(1 << 60)))
     rowmax = masked.max(dim=-1, keepdim=True).values
     d = score - rowmax
@@ -609,20 +636,19 @@ def frozen_softmax_context(
     # Latest QEXP page itself carries its endpoint/low-tail mapping.
     # No separate d==0 / zero-threshold detector is inserted here.
     e = art.page.infer(d)
-    e = torch.where(pair_valid, e, torch.zeros_like(e))
+    e = torch.where(key_valid, e, torch.zeros_like(e))
     if bool(torch.any((e < 0) | (e > 127)).item()):
         raise AssertionError("E7 QEXP escaped [0,127]")
 
     l = e.sum(dim=-1, dtype=torch.int64)               # [B,H,Q]
+    if bool(torch.any((l < SOFTMAX_L_MIN) | (l > SOFTMAX_L_MAX)).item()):
+        raise AssertionError("key-only Softmax rowsum escaped 127..8128")
     r = raw_reciprocal_v1(l)                          # [B,H,Q]
     n = exact_small_matmul(
         e, vh, reduction=tokens, max_term=127 * 127
     )                                                  # [B,H,Q,D]
     p = n * r.unsqueeze(-1)
     context_code = narrow_s8(round_shift_rne(p, SOFTMAX_RECIP_FRAC))
-    context_code = torch.where(
-        valid_token[:, None, :, None], context_code, torch.zeros_like(context_code)
-    )
     context = context_code.to(torch.float64) * art.value_scale
     return context.permute(0, 2, 1, 3).contiguous().reshape(bsz, tokens, hidden)
 

@@ -4,7 +4,7 @@
 This file reproduces the FINAL GaugePack v1 Softmax reciprocal page:
 
     QEXP code E       : U7, 0..127
-    non-zero row sum L: U13, 127..8128 (= 64 * 127)
+    legal row sum L   : U13, 127..8128 (= 64 * 127)
     numerator N       : signed S21 bound, |N| <= 127 * L
     target reciprocal : R ~= 2^23 / L
 
@@ -21,10 +21,11 @@ The final context operation is:
 
     context = NARROW_S8(RNE_even(N * R / 2^23))
 
-Padding queries use L=0 and bypass the reciprocal page with context=0.
+GaugePack v1 masks only the key axis.  Every query lane is active and every
+legal command contains at least one valid key, so L is always in 127..8128.
 
 Only NumPy is required.  The default run fits the page, checks it against the
-frozen coefficient snapshot, exhaustively certifies every legal non-zero L,
+frozen coefficient snapshot, exhaustively certifies every legal L,
 runs random signed (N,L) comparison vectors, and exports JSON/CSV/MEM files.
 
 Examples
@@ -65,7 +66,7 @@ BOUNDARY_COUNT = SEGMENT_COUNT - 1
 
 QEXP_MAX = 127
 SEQUENCE_LENGTH = 64
-L_MIN_NONZERO = QEXP_MAX
+L_MIN = QEXP_MAX
 L_MAX = SEQUENCE_LENGTH * QEXP_MAX
 L_BITS = 13
 N_BITS = 21
@@ -210,17 +211,14 @@ def exact_context_rne(
     numerator: np.ndarray | Sequence[int] | int,
     denominator: np.ndarray | Sequence[int] | int,
 ) -> np.ndarray:
-    """Exact signed RNE-even N/L oracle with the frozen L=0 -> 0 policy."""
+    """Exact signed RNE-even N/L oracle for a positive denominator."""
 
     n, l = np.broadcast_arrays(as_i64(numerator), as_i64(denominator))
-    if np.any(l < 0):
-        raise ValueError("Softmax denominator must be non-negative")
+    if np.any(l <= 0):
+        raise ValueError("Softmax denominator must be positive")
 
-    result = np.zeros_like(n)
-    active = l != 0
-    if np.any(active):
-        magnitude = round_unsigned_ratio_rne(np.abs(n[active]), l[active])
-        result[active] = np.where(n[active] < 0, -magnitude, magnitude)
+    magnitude = round_unsigned_ratio_rne(np.abs(n), l)
+    result = np.where(n < 0, -magnitude, magnitude)
     return narrow_s8(result)
 
 
@@ -326,13 +324,13 @@ class ReciprocalPage:
 
         l = as_i64(denominator)
         if np.any((l < self.x_min) | (l > self.x_max)):
-            raise ValueError("non-zero denominator is outside the certified page domain")
+            raise ValueError("denominator is outside the certified page domain")
         return np.searchsorted(as_i64(self.boundaries), l, side="right")
 
     def infer_reciprocal(
         self, denominator: np.ndarray | Sequence[int] | int
     ) -> np.ndarray:
-        """Bit-exact L -> R path, excluding the external L=0 bypass."""
+        """Bit-exact L -> R path for the certified 127..8128 domain."""
 
         self.validate()
         l = as_i64(denominator)
@@ -351,19 +349,12 @@ class ReciprocalPage:
         numerator: np.ndarray | Sequence[int] | int,
         denominator: np.ndarray | Sequence[int] | int,
     ) -> np.ndarray:
-        """Bit-exact frozen N,L -> context path, including L=0 bypass."""
+        """Bit-exact frozen N,L -> context path for legal positive L."""
 
         n, l = np.broadcast_arrays(as_i64(numerator), as_i64(denominator))
-        if np.any(l < 0):
-            raise ValueError("Softmax denominator must be non-negative")
-
-        output = np.zeros_like(n)
-        active = l != 0
-        if np.any(active):
-            reciprocal = self.infer_reciprocal(l[active])
-            product = n[active] * reciprocal
-            output[active] = round_shift_rne(product, RECIP_FRACTION_BITS)
-        return narrow_s8(output)
+        reciprocal = self.infer_reciprocal(l)
+        product = n * reciprocal
+        return narrow_s8(round_shift_rne(product, RECIP_FRACTION_BITS))
 
     def to_dict(self) -> Dict[str, Any]:
         """JSON-ready page description, including explicit DSP equations."""
@@ -484,8 +475,8 @@ def select_highest_feasible_shift(
 def fit_frozen_raw_v1() -> ReciprocalPage:
     """Fit/compile the final geometric raw-v1 reciprocal page from scratch."""
 
-    boundaries = geometric_boundaries(L_MIN_NONZERO, L_MAX)
-    limits = segment_limits(boundaries, L_MIN_NONZERO, L_MAX)
+    boundaries = geometric_boundaries(L_MIN, L_MAX)
+    limits = segment_limits(boundaries, L_MIN, L_MAX)
     lines = [
         relative_minimax_line(lo, hi, RECIP_TARGET_SCALE) for lo, hi in limits
     ]
@@ -505,7 +496,7 @@ def fit_frozen_raw_v1() -> ReciprocalPage:
 
     page = ReciprocalPage(
         name="gaugepack_sm_recip_raw_geometric_minimax_v1",
-        x_min=L_MIN_NONZERO,
+        x_min=L_MIN,
         x_max=L_MAX,
         target_scale=RECIP_TARGET_SCALE,
         boundaries=boundaries,
@@ -535,9 +526,9 @@ def assert_frozen_snapshot(page: ReciprocalPage) -> None:
 
 
 def legal_domain_certificate(page: ReciprocalPage) -> Dict[str, Any]:
-    """Exhaustively certify all 8002 legal non-zero rowsum values."""
+    """Exhaustively certify all 8002 legal rowsum values."""
 
-    l = np.arange(L_MIN_NONZERO, L_MAX + 1, dtype=np.int64)
+    l = np.arange(L_MIN, L_MAX + 1, dtype=np.int64)
     reciprocal = page.infer_reciprocal(l)
     segment = page.segment_index(l)
     p_value = (
@@ -562,8 +553,7 @@ def legal_domain_certificate(page: ReciprocalPage) -> Dict[str, Any]:
 
     return {
         "denominator_count": int(l.size),
-        "legal_nonzero_l": [L_MIN_NONZERO, L_MAX],
-        "l_zero_policy": "bypass reciprocal; context=0",
+        "legal_l": [L_MIN, L_MAX],
         "rowsum_bits": L_BITS,
         "numerator_bits": N_BITS,
         "max_numerator_magnitude": max_numerator_magnitude,
@@ -633,7 +623,7 @@ def validate_pairs(
     """Validate a legal pair set against exact signed RNE N/L."""
 
     n, l = np.broadcast_arrays(as_i64(numerator), as_i64(denominator))
-    legal_l = (l == 0) | ((l >= L_MIN_NONZERO) & (l <= L_MAX))
+    legal_l = (l >= L_MIN) & (l <= L_MAX)
     if np.any(~legal_l):
         bad = int(l[~legal_l][0])
         raise ValueError(f"{label}: illegal denominator {bad}")
@@ -644,10 +634,10 @@ def validate_pairs(
     prediction = page.infer_context(n, l)
     metrics = error_metrics(reference, prediction)
     metrics["label"] = label
-    metrics["denominator_min"] = int(l.min(initial=0))
-    metrics["denominator_max"] = int(l.max(initial=0))
-    metrics["numerator_min"] = int(n.min(initial=0))
-    metrics["numerator_max"] = int(n.max(initial=0))
+    metrics["denominator_min"] = int(l.min())
+    metrics["denominator_max"] = int(l.max())
+    metrics["numerator_min"] = int(n.min())
+    metrics["numerator_max"] = int(n.max())
     return metrics
 
 
@@ -660,7 +650,7 @@ def random_pair_audit(
         raise ValueError("random pair count must be positive")
     generator = np.random.default_rng(seed)
     l = generator.integers(
-        L_MIN_NONZERO, L_MAX + 1, size=count, dtype=np.int64
+        L_MIN, L_MAX + 1, size=count, dtype=np.int64
     )
     bound = QEXP_MAX * l
     # Uniformly choose one integer from each pair's variable legal interval.
@@ -668,8 +658,8 @@ def random_pair_audit(
     n = np.floor(unit * (2.0 * bound.astype(np.float64) + 1.0)).astype(np.int64)
     n -= bound
 
-    # Add exact endpoints, every segment boundary neighbor, and L=0 bypasses.
-    probe_l: List[int] = [0, L_MIN_NONZERO, L_MAX]
+    # Add exact legal endpoints and every segment boundary neighbor.
+    probe_l: List[int] = [L_MIN, L_MAX]
     for boundary in page.boundaries.tolist():
         probe_l.extend([boundary - 1, boundary, min(boundary + 1, L_MAX)])
     probe_l_array = np.asarray(probe_l, dtype=np.int64)
@@ -755,9 +745,10 @@ def export_artifact(
             "e_min": 0,
             "e_max": QEXP_MAX,
             "sequence_length": SEQUENCE_LENGTH,
+            "masking": "key-only; beat key_valid is broadcast to all query lanes",
         },
         "integer_contract": {
-            "L": "U13; 0 or 127..8128",
+            "L": "U13; legal domain 127..8128",
             "N": "S21 bound; |N|<=127L",
             "R": "nonnegative S18 container",
             "reciprocal_dsp": "A27 * M18 + C48 -> P48",
@@ -847,8 +838,12 @@ def self_test() -> Dict[str, Any]:
         if left_segment != boundary_index or boundary_segment != boundary_index + 1:
             raise AssertionError("boundary side='right' semantics changed")
 
-    if int(page.infer_context(123, 0)) != 0:
-        raise AssertionError("L=0 bypass policy failed")
+    try:
+        page.infer_context(123, 0)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("L=0 must be rejected as an illegal Softmax state")
 
     certificate = legal_domain_certificate(page)
     if certificate["certified_max_context_code_error"] != 2:
