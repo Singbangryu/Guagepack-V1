@@ -10,19 +10,18 @@
 //   e_i[8*q +: 8]         = E7[q,key] in a physical byte, bit7=0
 //
 // Therefore this block owns 16 independent row states.  It does NOT reduce the
-// 16 lanes into one scalar.  On every accepted key beat it updates:
+// 16 lanes into one scalar.  On every enabled valid key beat it updates:
 //
 //   rowmax[q] = max(rowmax[q], score[q,key])
 //   rowsum[q] = rowsum[q] + E[q,key]
 //
-// while score_accept_o/e_accept_o qualify the simultaneous external scratch
-// write.  Scratch storage itself remains outside this block, so the score/E
-// row is not duplicated in registers here.
+// Scratch storage itself remains outside this block, so the score/E row is not
+// duplicated in registers here.
 //
 // clear_i marks key beat 0 of a 16-query group.  last_i marks the final key
-// beat.  Lifecycle sidebands are consumed only with an accepted valid beat.
-// done_o and the final packed state become visible on that same accepted last
-// edge.  A global ce_i stall holds both state and done_o.
+// beat.  Inputs are consumed only when ce_i && valid_i.  done_o and the final
+// packed state become visible on that same last edge.  A ce_i stall holds both
+// state and done_o.
 // =============================================================================
 
 module vfu_softmax (
@@ -39,10 +38,6 @@ module vfu_softmax (
     input  wire [15:0]              score_lane_valid_i,
     input  wire [383:0]             score_i,             // 16 x S24
 
-    // Use this as the score-scratch write qualifier.  score_i and
-    // score_lane_valid_i are the accompanying payload.
-    output wire                     score_accept_o,
-
     // 16 x S24 row maxima and one validity bit per query row.  An all-masked
     // query row returns rowmax=0 and has_valid=0.
     output reg                      rowmax_done_o,
@@ -58,10 +53,6 @@ module vfu_softmax (
     input  wire [15:0]              e_lane_valid_i,
     input  wire [127:0]             e_i,                 // 16 x E7 byte
 
-    // Use this as the E-scratch write qualifier.  e_i and e_lane_valid_i are
-    // the accompanying payload.
-    output wire                     e_accept_o,
-
     // 16 x U13 rowsums.  rowsum_zero_o directly supplies the per-query L==0
     // semantic sideband for the reciprocal phase.
     output reg                      rowsum_done_o,
@@ -70,9 +61,6 @@ module vfu_softmax (
 );
 
     integer lane;
-
-    assign score_accept_o = rst_ni && ce_i && rowmax_valid_i;
-    assign e_accept_o     = rst_ni && ce_i && rowsum_valid_i;
 
     genvar zero_lane;
     generate

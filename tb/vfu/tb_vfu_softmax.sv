@@ -11,7 +11,6 @@ module tb_vfu_softmax;
     reg [15:0] score_lane_valid_i = 16'd0;
     reg [383:0] score_i = 384'd0;
 
-    wire score_accept_o;
     wire rowmax_done_o;
     wire [383:0] rowmax_o;
     wire [15:0] rowmax_has_valid_o;
@@ -22,7 +21,6 @@ module tb_vfu_softmax;
     reg [15:0] e_lane_valid_i = 16'd0;
     reg [127:0] e_i = 128'd0;
 
-    wire e_accept_o;
     wire rowsum_done_o;
     wire [207:0] rowsum_o;
     wire [15:0] rowsum_zero_o;
@@ -30,8 +28,6 @@ module tb_vfu_softmax;
     integer key;
     integer lane;
     integer errors = 0;
-    integer score_accept_count;
-    integer e_accept_count;
     integer expected_max [0:15];
     integer expected_sum [0:15];
     reg [15:0] expected_has_valid;
@@ -52,7 +48,6 @@ module tb_vfu_softmax;
         .rowmax_last_i(rowmax_last_i),
         .score_lane_valid_i(score_lane_valid_i),
         .score_i(score_i),
-        .score_accept_o(score_accept_o),
         .rowmax_done_o(rowmax_done_o),
         .rowmax_o(rowmax_o),
         .rowmax_has_valid_o(rowmax_has_valid_o),
@@ -62,23 +57,10 @@ module tb_vfu_softmax;
         .rowsum_last_i(rowsum_last_i),
         .e_lane_valid_i(e_lane_valid_i),
         .e_i(e_i),
-        .e_accept_o(e_accept_o),
         .rowsum_done_o(rowsum_done_o),
         .rowsum_o(rowsum_o),
         .rowsum_zero_o(rowsum_zero_o)
     );
-
-    always @(posedge clk_i) begin
-        if (!rst_ni) begin
-            score_accept_count <= 0;
-            e_accept_count <= 0;
-        end else begin
-            if (score_accept_o)
-                score_accept_count <= score_accept_count + 1;
-            if (e_accept_o)
-                e_accept_count <= e_accept_count + 1;
-        end
-    end
 
     task automatic send_score(
         input bit clear,
@@ -265,8 +247,8 @@ module tb_vfu_softmax;
         repeat (2) begin
             @(posedge clk_i);
             #1;
-            if (score_accept_o || rowmax_done_o) begin
-                $display("FAIL ROWMAX accepted/changed during CE stall");
+            if (rowmax_done_o) begin
+                $display("FAIL ROWMAX done changed during CE stall");
                 errors = errors + 1;
             end
         end
@@ -317,17 +299,6 @@ module tb_vfu_softmax;
         if (expected_sum[0] !== 8128 || expected_sum[1] !== 2016
             || expected_sum[2] !== 1000 || expected_sum[15] !== 0) begin
             $display("FAIL testbench ROWSUM reference constants");
-            errors = errors + 1;
-        end
-
-        if (score_accept_count !== 68) begin
-            $display("FAIL score_accept_count=%0d expected=68",
-                     score_accept_count);
-            errors = errors + 1;
-        end
-
-        if (e_accept_count !== 64) begin
-            $display("FAIL e_accept_count=%0d expected=64", e_accept_count);
             errors = errors + 1;
         end
 
