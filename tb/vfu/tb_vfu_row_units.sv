@@ -13,8 +13,9 @@ module tb_vfu_row_units;
     reg [127:0] e_i = 128'd0;
 
     wire rowmax_valid;
-    wire rowsum_valid;
+    wire exp_commit_valid;
     wire [383:0] rowmax;
+    wire [127:0] e_commit;
     wire [207:0] rowsum;
 
     integer key;
@@ -32,11 +33,12 @@ module tb_vfu_row_units;
         .result_valid_o(rowmax_valid), .rowmax_o(rowmax)
     );
 
-    vfu_rowsum16 u_rowsum (
+    vfu_exp_commit16 u_exp_commit (
         .clk_i(clk_i), .rst_ni(rst_ni), .ce_i(ce_i),
         .valid_i(valid_i), .clear_i(clear_i), .last_i(last_i),
         .key_valid_i(key_valid_i), .e_i(e_i),
-        .result_valid_o(rowsum_valid), .rowsum_o(rowsum)
+        .result_valid_o(exp_commit_valid), .e_o(e_commit),
+        .rowsum_o(rowsum)
     );
 
     initial begin
@@ -63,6 +65,17 @@ module tb_vfu_row_units;
             key_valid_i = (key < 5);
             @(posedge clk_i);
             #1;
+
+            if (key_valid_i) begin
+                if (e_commit !== e_i) begin
+                    $display("FAIL: valid E commit mismatch at key=%0d", key);
+                    errors = errors + 1;
+                end
+            end else if (e_commit !== 128'd0) begin
+                $display("FAIL: invalid key committed nonzero E at key=%0d", key);
+                errors = errors + 1;
+            end
+
             valid_i = 1'b0;
             clear_i = 1'b0;
             last_i = 1'b0;
@@ -70,7 +83,7 @@ module tb_vfu_row_units;
             @(negedge clk_i);
         end
 
-        if (!rowmax_valid || !rowsum_valid) begin
+        if (!rowmax_valid || !exp_commit_valid) begin
             $display("FAIL: result_valid missing");
             errors = errors + 1;
         end
@@ -89,7 +102,7 @@ module tb_vfu_row_units;
         end
 
         if (errors == 0)
-            $display("PASS: vfu rowmax/rowsum units");
+            $display("PASS: vfu rowmax/QEXP commit units");
         else
             $display("FAIL: errors=%0d", errors);
         $finish;
