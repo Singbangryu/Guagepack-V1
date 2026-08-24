@@ -416,6 +416,13 @@ d      : score-rowmax = S25
 
 Invalid key는 rowmax 계산에서 제외한다.
 
+PMPU의 DOT1 score drain은 tile 안에서 key column을 `15→0` 순서로 내보낸다.
+따라서 `seq_len<16`이면 첫 physical score beat가 invalid일 수 있다. 각 16-query
+tile 시작 시 rowmax를 `S24_MIN=24'sh800000`으로 초기화하고,
+`key_valid=1`인 beat만 max-update한다. 첫 physical beat의 score로 초기화하는
+방식은 금지한다. Legal command에는 valid key가 반드시 있으므로 별도
+`rowmax_has_valid` state/output은 두지 않는다.
+
 `s_score`는 positive constant이므로 raw integer score에서 rowmax를 구해도
 scaled score에서 구한 rowmax와 같은 key를 선택한다. 따라서 rowmax 앞에
 별도 scale 회로가 필요 없다.
@@ -425,23 +432,37 @@ scaled score에서 구한 rowmax와 같은 key를 선택한다. 따라서 rowmax
 GaugePack v1은 한 번에 16개 query row와 현재 key 하나의 score를 처리한다.
 
 ```text
-command : key_mask[63:0]
-beat    : key_valid = key_mask[key_index]  (1 bit)
+command : seq_len[6:0]  (BERT input의 실제 token 수, legal 2...64)
+beat    : key_valid = (key_index < seq_len)  (1 bit)
 lanes   : 같은 key_valid를 16개 query lane에 broadcast
 ```
+
+QK ingest에서는 `key_index=o_feat`이고, score replay에서는 현재 replay address가
+`key_index`다. 두 phase가 같은 `seq_len` 비교 계약을 사용한다.
+
+`M/N/K`는 PMPU가 실제로 처리하는 scheduled matrix dimension이고, QK의
+`N_sched`는 padded key dimension이다. `seq_len`은 그중 유효한 token prefix의
+길이이며 `M/N/K`에서 추론하지 않는다. `seq_len`은 첫 QK score beat가
+들어오기 전에 VFU Softmax controller가 latch하고 score/rowmax, score replay,
+QEXP/rowsum이 끝날 때까지 유지한다. Generic RQ, GELU, residual, LayerNorm은
+token 간 reduction을 하지 않으므로 `seq_len`을 사용하지 않는다.
 
 16개 query lane은 모두 architectural active lane이다. 입력 tensor에 padding token
 위치가 있더라도 Softmax 안에서 invalid query lane으로 바꾸지 않고 계산한다.
 따라서 Softmax datapath에는 `query_valid`와 lane별 `pair_valid[15:0]`가 없다.
 
-Legal Softmax command는 valid key를 최소 하나 포함해야 한다.
+Legal Softmax command는 `[CLS]`와 `[SEP]`를 포함한다.
 
 ```text
-|key_mask[63:0]| != 0
+2 <= seq_len <= N_sched <= 64
 ```
 
-GaugePack v1 BERT encoder는 causal/lane별 attention mask를 지원하지 않는다.
-masking은 key 축에만 적용한다.
+값 64를 그대로 표현해야 하므로 `seq_len`은 U7이다. U6로 줄이면 64가 0으로
+alias되므로 금지한다.
+
+GaugePack v1 BERT encoder의 valid token은 index 0부터 연속된 prefix이고 padding은
+suffix다. 따라서 일반 `key_mask[63:0]`, causal/lane별 attention mask는 지원하지
+않는다. Masking은 `seq_len`으로 판정하는 key 축에만 적용한다.
 
 ## 7.4 QEXP
 
@@ -484,11 +505,12 @@ physical   : 8-bit byte, bit7=0
 
 ## 7.5 Rowsum
 
-Sequence length `<=64`:
+`2<=seq_len<=64`:
 
 ```text
-L = Σ E_j  (valid key만 포함; invalid key의 E_j=0)
-L_max = 64 × 127 = 8128
+L = Σ E_j, 0 <= j < seq_len
+invalid key의 E_j = 0
+L_max(seq_len) = seq_len × 127 <= 64 × 127 = 8128
 ```
 
 Legal command에는 valid key가 하나 이상 있다. 각 query row의 rowmax 위치는
@@ -1177,6 +1199,8 @@ Softmax:
 score S24 raw QK accumulator
 rowmax S24
 d S25
+seq_len U7, legal 2...64
+key_valid = (key_index < seq_len), scalar broadcast
 QEXP score scale = s_Q × s_K / sqrt(head_dim), page-folded
 E7 [0,127]
 L U13
@@ -1324,6 +1348,7 @@ operator-specific POST
 ## 14.2 Softmax
 
 ```text
+seq_len U7 → key_valid=(key_index<seq_len), key 축만 gate
 QK raw S24  (s_Q×s_K/sqrt(H)는 QEXP page에 fold)
   ↓ rowmax S24
 score-rowmax S25
@@ -1436,6 +1461,7 @@ GELU
 S32/A27 → PWL M18/C48 → P48 → terminal S8
 
 SOFTMAX
+seq_len U7 → scalar key_valid=(key_index<seq_len)
 score raw S24  [QEXP에 s_Q×s_K/sqrt(H) fold]
 rowmax S24
   ↓
