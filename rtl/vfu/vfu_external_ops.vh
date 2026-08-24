@@ -3,16 +3,10 @@
 
 // =============================================================================
 // GaugePack VFU TOP operation contract
-// =============================================================================
-// "Internal ops are not exposed" is an RTL interface rule, not documentation
-// secrecy:
 //
 //   TOP -> VFU controller : VFU_TOP_OP_W-bit function-level op
 //   VFU controller -> CORE16/reduction blocks : private 4-bit VFU_OP_* micro-op
 //
-// TOP must never drive or observe the private 4-bit micro-op field.  The VFU
-// controller expands each TOP op into the internal sequence documented below.
-// Internal macro definitions and encodings remain in vfu_defs.vh.
 //
 // -----------------------------------------------------------------------------
 // VFU_RQ
