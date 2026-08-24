@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 
+// DRAFT: superseded by vfu_rowmax16 and vfu_rowsum16.
 // =============================================================================
 // GaugePack Softmax row state -- 16 query lanes
 // =============================================================================
@@ -26,7 +27,7 @@
 // is high.  A ce_i stall holds state and done.
 // =============================================================================
 
-module vfu_softmax (
+module vfu_softmax_draft (
     input  wire                     clk_i,
     input  wire                     rst_ni,
     input  wire                     ce_i,

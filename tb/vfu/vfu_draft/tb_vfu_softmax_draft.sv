@@ -1,5 +1,6 @@
 `timescale 1ns/1ps
 
+// DRAFT: testbench for the superseded combined Softmax row-state module.
 // GaugePack Softmax reduction tests for the key-only masking contract.
 //
 // One input beat is one key column across all 16 query rows.  key_valid_i is
@@ -7,7 +8,7 @@
 // masking, so rowsum receives final E7 bytes and simply accumulates all lanes.
 // A legal command has at least one valid key; L=0 is not tested as a legal
 // result.
-module tb_vfu_softmax;
+module tb_vfu_softmax_draft;
     reg clk_i;
     reg rst_ni = 1'b0;
     reg ce_i = 1'b1;
@@ -42,7 +43,7 @@ module tb_vfu_softmax;
     initial clk_i = 1'b0;
     always #5 clk_i = ~clk_i;
 
-    vfu_softmax dut (
+    vfu_softmax_draft dut (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
         .ce_i(ce_i),
