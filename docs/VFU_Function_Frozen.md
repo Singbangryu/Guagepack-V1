@@ -2,12 +2,41 @@
 
 > **파일:** `VFU_Function_Frozen.md`  
 > **상태:** **FROZEN — VFU 산술/계산 그래프 기준 문서**  
-> **날짜:** 2026-08-24
+> **최종 갱신:** 2026-08-27  
 > **범위:** GaugePack BERT-Tiny VFU — Requantization, GELU, Softmax, LayerNorm  
+> **최상위 결정 원장:** `gaugepack-master-work.md` 최신 FROZEN  
 > **상위 아키텍처 기준:** `GaugePack_VFU_Architecture_Frozen_v1.md`  
 > **목적:** 이 파일 하나만 읽고 VFU의 계산 그래프, CORE16 4-stage 동작, operand mapping, bitwidth, scale, RNE/SAT 위치, compiler 책임을 파악할 수 있게 한다.
 
 > **중요:** LayerNorm residual add는 DSP/PRE 연산이 아니다. `main` branch만 DSP를 통해 requant한 뒤, **S3 POST-ALU에서 `main8 + original_skip8 -> z:S9`**를 수행한다.
+
+> **2026-08-24 승계 감사 주의:** 이 문서의 식/bitwidth/RNE/SAT 계약은 FROZEN이다.
+> 하지만 production coefficient payload, current RTL build, scratch/controller,
+> physical layout, per-command QK/PV granularity, PMPU no-touch/fifo contract와 최신
+> padded E2E는 완료됐거나 동결됐다는 뜻이 아니다. `OPEN-SPAD-001`,
+> `OPEN-SCHED-001`, `OPEN-PMPU-001`, `OPEN-PMPU-MR-001`, `OPEN-PMPU-SEL-001`을 포함한 구현/검증 상태는 Master §6/§7과
+> `GaugePack_WorkMaster_Succession_2026-08-24.md`를 따른다.
+
+> **2026-08-25 memory hierarchy — `SPAD-20260825-001`, `MEM-20260825-001`:** S-pad는 VFU-private
+> intermediate-only scratch다. PMPU가 사용할 E7/context/PV용 corner-turned V/final activation은
+> PMPU-visible Logical-DRAM에 먼저 commit한 뒤 PMPU가 reload한다. Logical-DRAM은
+> on-chip operand-store abstraction이며 logical bank별 BRAM/URAM 선택은
+> `OPEN-MEM-PHYS-001`이다. 아래 계산 그래프의
+> `direct E7 PV`는 E7를 normalized `E/L`로 바꾸지 않는 산술 의미이며
+> `S-pad→PMPU` 직접 물리 경로를 뜻하지 않는다.
+
+> **2026-08-27 hybrid scratch 정합화 — `SPAD-20260825-004`,
+> `SPAD-20260827-005`:** Dynamic V transpose는 Intermediate S-pad가 아니라 dedicated
+> `vfu_vcorner_ff`가 담당한다. Intermediate S-pad의 resident는 raw Score와 LayerNorm
+> `z/T`뿐이며, schedule-robust production memory leaf는 16 banks × 512 depth × 32-bit
+> opaque container, synchronous 1R1W로 둔다. Exact Score/LN address overlay는 계속
+> `OPEN-SPAD-001`이다.
+
+> **VFU memory client — `VFU-MEM-20260825-001`:** PMPU는 operand-store read-only지만
+> VFU는 read/write client다. Residual/skip tensor를 읽고 final tensor를 commit-write한다.
+> RQ `M/C/F`, NN-LUT page, LN gamma/beta처럼 command 동안 고정되는 작은 parameter는
+> tensor stream과 분리된 config/parameter bank에서 preload해 local register에 latch하며,
+> 매 beat main URAM에서 다시 읽지 않는다.
 
 ---
 
@@ -384,14 +413,14 @@ score:S24 ──────────────┐
           ┌───────┴────────┐
           │                │
           ▼                ▼
-     E scratch          L=ΣE:U13
+  E7 L-DRAM commit      L=ΣE:U13
           │                │
           │                ▼
           │         RAW reciprocal PWL
           │         R≈2^23/L:S18+
           │                │
           ▼                │
-       PMPU PV             │
+  L-DRAM reload→PMPU PV    │
    N=Σ(E×V):S21            │
           │                │
           └────────┬───────┘
@@ -433,36 +462,77 @@ GaugePack v1은 한 번에 16개 query row와 현재 key 하나의 score를 처�
 
 ```text
 command : seq_len[6:0]  (BERT input의 실제 token 수, legal 2...64)
+schedule: seq_len_padded = 16 × ceil(seq_len/16), one of 16/32/48/64
 beat    : key_valid = (key_index < seq_len)  (1 bit)
 lanes   : 같은 key_valid를 16개 query lane에 broadcast
 ```
 
-QK ingest에서는 `key_index=o_feat`이고, score replay에서는 현재 replay address가
-`key_index`다. 두 phase가 같은 `seq_len` 비교 계약을 사용한다.
+QK ingest에서는 `key_index=o_feat[8:0]`이고, score replay에서는 현재 replay address가
+`key_index`다. QK는 full-width `o_feat<N_sched` 및 `o_feat<64`를 검사한 뒤에만
+`o_feat[5:0]`를 score address로 사용한다. 6-bit truncate 후 검사하거나 beat counter로
+reverse-drain 주소를 재구성하지 않는다. 두 phase가 같은 `seq_len` 비교 계약을 사용한다.
+PMPU의 QK data는 S32 container이므로 각 lane에서
+`acc[31:24]=={8{acc[23]}}`를 assert한 뒤 `acc[23:0]`를 score S24로 pack한다.
+상위비트 확인 없는 truncate/saturation은 금지한다.
 
-`M/N/K`는 PMPU가 실제로 처리하는 scheduled matrix dimension이고, QK의
-`N_sched`는 padded key dimension이다. `seq_len`은 그중 유효한 token prefix의
-길이이며 `M/N/K`에서 추론하지 않는다. `seq_len`은 첫 QK score beat가
+Host는 token tensor의 valid prefix `seq_len`을 보존하고 suffix를 `seq_len_padded`까지
+padding한다. `M/N/K`는 PMPU가 실제로 처리하는 scheduled matrix dimension이며:
+
+```text
+Q/K/V, output projection, FFN : M = seq_len_padded
+QK per head                   : M=N=seq_len_padded, K=head_dim
+PV per head                   : M=seq_len_padded, N=head_dim, K=seq_len_padded
+```
+
+QK의 `N_sched=seq_len_padded`는 padded key dimension이다. `seq_len`은 그중 유효한 token
+prefix 길이이며 scheduled `M/N/K`에서 역추론하지 않는다. `seq_len`은 첫 QK score beat가
 들어오기 전에 VFU Softmax controller가 latch하고 score/rowmax, score replay,
 QEXP/rowsum이 끝날 때까지 유지한다. Generic RQ, GELU, residual, LayerNorm은
 token 간 reduction을 하지 않으므로 `seq_len`을 사용하지 않는다.
 
-16개 query lane은 모두 architectural active lane이다. 입력 tensor에 padding token
-위치가 있더라도 Softmax 안에서 invalid query lane으로 바꾸지 않고 계산한다.
-따라서 Softmax datapath에는 `query_valid`와 lane별 `pair_valid[15:0]`가 없다.
+위 `M/N/K`는 padded tensor/job 축의 의미다. Current PMPU에서 한 QK command의
+`M_cmd=seq_len_padded`를 주면 여러 `o_tr` query tile이 연속 drain된다. 현재 Softmax
+row state와 raw-score S-pad live set은 한 16-query tile 기준으로 작성된 부분이 있으므로, 실제 attention command를
+`M_cmd=16`으로 tile-loop할지 multi-tile buffering을 지원할지는 Master
+`OPEN-SCHED-001`이며 이 문서의 산술식으로 임의 결정하지 않는다. `SPAD-20260825-001`에
+따라 PMPU-visible Logical-DRAM은 feature-major `addr=feature*MT+tr`를 사용하고,
+S-pad는 private layout이다. Commit path가 두 layout 사이 pack/transpose를 소유한다.
+또한 co-worker가 수정하기로 한 external PMPU row-dimension register `M_r`의 새
+commit/diff는 아직 확인되지 않았다. 이 `M_r`는 §7.6 reciprocal slope와 다른 신호다.
+`OPEN-PMPU-MR-001`을 감사하기 전에는 current `M_r→MT` 동작을 최종 schedule의
+근거로 확정하지 않는다.
+
+16개 physical query lane은 모두 실행한다. 마지막 tile의
+`query_index>=seq_len` row는 padded/don't-care output이지만 다른 query row와
+reduction state를 공유하지 않으므로 valid row를 오염시키지 않는다. 따라서
+Softmax datapath에는 `query_valid`와 lane별 `pair_valid[15:0]`가 없다.
 
 Legal Softmax command는 `[CLS]`와 `[SEP]`를 포함한다.
 
 ```text
-2 <= seq_len <= N_sched <= 64
+2 <= seq_len <= 64
+seq_len_padded = N_sched = 16 × ceil(seq_len/16)
+seq_len <= N_sched <= 64
 ```
 
 값 64를 그대로 표현해야 하므로 `seq_len`은 U7이다. U6로 줄이면 64가 0으로
-alias되므로 금지한다.
+alias되므로 금지한다. `seq_len_padded/N_sched`도 64를 표현해야 하므로 U7이다.
 
 GaugePack v1 BERT encoder의 valid token은 index 0부터 연속된 prefix이고 padding은
 suffix다. 따라서 일반 `key_mask[63:0]`, causal/lane별 attention mask는 지원하지
 않는다. Masking은 `seq_len`으로 판정하는 key 축에만 적용한다.
+Padded input code를 0으로 채우더라도 projection bias 이후 key/value가 0이라고
+보장되지 않으므로 이 key-axis mask는 생략할 수 없다.
+
+Acceptance criteria:
+
+```text
+1. seq_len_padded == 16/32/48/64 and seq_len <= seq_len_padded < seq_len+16
+2. QK는 query tile마다 정확히 seq_len_padded개의 scheduled key beat를 처리
+3. key_index>=seq_len인 beat는 rowmax/rowsum을 갱신하지 않고 QEXP E=0
+4. valid query prefix [0,seq_len)의 context는 unpadded variable-S golden과 일치
+5. padded query suffix [seq_len,seq_len_padded)의 output은 correctness 비교 대상에서 제외
+```
 
 ## 7.4 QEXP
 
@@ -508,6 +578,19 @@ physical   : 8-bit byte, bit7=0
 `2<=seq_len<=64`:
 
 ```text
+input contract:
+  valid_i      = E beat transaction-valid
+  key_valid_i  = controller가 replay key index와 seq_len으로 생성한 scalar
+
+update:
+  fire && clear_i              -> L = key_valid_i ? E : 0
+  fire && !clear_i && key_valid_i -> L = L + E
+  fire && !key_valid_i         -> 누적값 유지
+
+주의:
+  key_valid_i는 산술 update만 gate한다.
+  clear_i/last_i/result_valid_o는 scheduled beat 기준으로 진행한다.
+
 L = Σ E_j, 0 <= j < seq_len
 invalid key의 E_j = 0
 L_max(seq_len) = seq_len × 127 <= 64 × 127 = 8128
@@ -958,7 +1041,9 @@ rho_code : U8 [0,255]
 rho_real ≈ rho_code × s_rho
 ```
 
-`D=0`이면 `rho=0`으로 처리한다.
+`D=0`을 위한 별도 detector나 zero override는 두지 않는다. Constant row는
+`n=128z-S=0`이므로 page가 내는 finite clamped `rho` 값과 무관하게 다음
+NORMALIZE의 `T=n×rho`가 정확히 0이 된다.
 
 ### 4-stage
 
@@ -967,7 +1052,7 @@ rho_real ≈ rho_code × s_rho
 | S0 | `D27:U27`, segment select |
 | S1 | `A:S27=D27`, `B:S18=M_rsqrt[seg]`, `C:S48=C_rsqrt[seg]` |
 | S2 | `P:S48=D27×M+C` |
-| S3 | PWL decode / RNE / U8 clamp → `rho:U8`, `D=0` → 0 |
+| S3 | PWL decode / RNE / U8 clamp → `rho:U8` |
 
 ---
 
@@ -1128,13 +1213,21 @@ y8        : S8 [-127,127]
 
 # 10. Scratch / lifetime
 
+S-pad는 architectural tensor store가 아니라 VFU phase-local intermediate store다.
+PMPU operand와 다음 layer가 소비할 final code는 Logical-DRAM에 commit한다.
+
 ## 10.1 Softmax
 
 ```text
 Score    : 16 × S24 = 384 meaningful bits
-E7       : 16 × 8-bit physical = 128 bits / 112 meaningful bits
-Context  : 16 × S8 = 128 bits
+E7       : 16 × 8-bit physical commit beat; Logical-DRAM tensor로 기록
+Context  : 16 × S8 final commit beat; Logical-DRAM tensor로 기록
 ```
+
+Softmax에서 S-pad의 필수 resident 값은 replay가 필요한 raw Score다. E7는 QEXP/rowsum과
+동시에 Logical-DRAM commit stream으로 내보낼 수 있으며 Context는 final S8 생성 후
+Logical-DRAM에 commit한다. 구현상 skid/pack staging을 둘 수는 있지만 PMPU-visible
+resident tensor로 취급하지 않는다.
 
 ## 10.2 LayerNorm overlay
 
@@ -1157,6 +1250,38 @@ L4 replay z, overwrite with T
   ↓
 L5 read T, write final S8
 ```
+
+## 10.3 Dynamic V corner-turn
+
+Runtime physical transpose는 PMPU `P·V`를 위한 dynamic V 16×16 corner-turn 하나뿐이다.
+V projection output tile은 dedicated `2×16×16×S8` ping-pong FF leaf
+`vfu_vcorner_ff`에 feature-column 방향으로 기록하고 token-row 방향으로 drain한 뒤
+PMPU-native `PV_WGT16` layout으로 Logical-DRAM에 commit한다. V-corner는 Intermediate
+S-pad의 address/data/port를 사용하지 않는다. Static INT4 W는 Host/DMA가 이미 `W^T`
+layout으로 초기 적재하므로 VFU runtime transpose 대상이 아니다.
+
+## 10.4 Intermediate S-pad container
+
+Intermediate S-pad는 raw Score와 LayerNorm `z/T`를 위한 16-bank memory다. 한 accepted
+beat의 16 lane은 동일 logical key/feature address를 사용하므로 bank별 독립 address나
+lane별 write-enable은 필요하지 않다. Source adapter가 다음처럼 32-bit container를 만든다.
+
+```text
+Score S24 -> S32 sign extension
+z S9      -> S32 sign extension
+T S25     -> S32 sign extension
+```
+
+Production memory leaf의 기본 geometry는 `16 banks × 512 depth × 32-bit`, synchronous
+`1R1W`, compile-time `SPAD_RD_LAT={1,2}` 지원과 default `2`다. Depth 512는 full padded-M
+phase-serial schedule과 repeated-M16 schedule을 모두 수용하며, `512×36` BRAM 후보에서
+depth 128로 줄여도 bank당 primitive 수가 줄지 않는다. Memory leaf는 signedness나 mode를
+해석하지 않고 32-bit pattern만 보존한다. Data array는 reset하지 않으며 same-bank
+same-address read/write 결과에 의존하지 않는다.
+
+Score/LN mode, exact address overlay, rowmax/S/Q/L/R side state, controller sideband pipeline,
+Logical-DRAM commit은 memory leaf 밖에 남고 `OPEN-SPAD-001` 및 관련 controller 결정에서
+동결한다. BRAM/URAM primitive 자체도 합성 결과 전에는 기능 계약이 아니다.
 
 ---
 
@@ -1430,13 +1555,17 @@ T×M_gamma+C_beta → P48
 
 충돌 시 다음 순서로 본다.
 
-1. `VFU_Function_Frozen.md` — VFU arithmetic / calculation graph 기준 문서
-2. `GaugePack_VFU_Architecture_Frozen_v1.md` — 전체 frozen architecture/dataflow
-3. current compiler artifacts / manifests — 실제 coefficient 값
-4. current PRE/POST/CORE RTL — 구현 및 closure 대상
-5. older RevA/RevB / 7-pass spreadsheets — history only
+1. Project owner의 현재 대화 내 명시적 지시
+2. Library `gaugepack-master-work.md`의 최신 `FROZEN` 결정
+3. `GaugePack_VFU_Architecture_Frozen_v1.md` — 명시적 `OPEN`을 제외한 frozen architecture/dataflow
+4. `VFU_Function_Frozen.md` — VFU arithmetic / calculation graph 기준 문서
+5. current compiler artifacts / manifests — 실제 production coefficient 값
+6. current PRE/POST/CORE RTL/TB — 구현 및 closure 증거
+7. older RevA/RevB / 7-pass spreadsheets / Git의 stale Frozen mirror — history only
 
-`VFU_Function_Frozen.md`와 frozen architecture가 충돌하면 조용히 한쪽을 선택하지 말고 **contract mismatch**로 취급해 둘 다 수정한다.
+Master, `VFU_Function_Frozen.md`, frozen architecture가 충돌하면 조용히 한쪽을
+선택하지 말고 **contract mismatch**로 취급한다. Master에 `OPEN`으로 기록하고
+판정 후 두 Frozen 문서를 같은 revision decision으로 정렬한다.
 
 ---
 
