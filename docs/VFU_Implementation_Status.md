@@ -1,9 +1,9 @@
 # GaugePack VFU Current Implementation Status
 
 > **문서 성격:** Git source/TB/model의 구현·검증 현황 snapshot
-> **감사일:** 2026-08-27
-> **감사 기준 source HEAD:** `d41d7da926aab16c7efe619fbdc730ef2da33ace`
-> **정본 baseline:** Master v22 / Architecture v20 / Function v13
+> **감사일:** 2026-08-28
+> **감사 기준 implementation HEAD:** `afb6e4200c52fc4fb3af864b960fab4d3348337f`
+> **정본 baseline:** Master v24 / Architecture v21 / Function v13
 > **대상:** `rtl/vfu`, `tb/vfu`, `model`
 
 이 문서는 현재 repository에 실제로 존재하는 구현과 확인된 증거를 정리합니다.
@@ -36,8 +36,8 @@ unit test PASS를 전체 VFU·합성·hardware 검증으로 확대하지 않습�
 | POST lane | `rtl/vfu/post_alu/vfu_post_alu_lane.v` | `IMPLEMENTED`, `BUILD_BLOCKED`, `SPEC_MISMATCH` | 단일 lane source 존재. `force_zero_i` 기반 LN `D=0→rho=0` override가 Function v13과 충돌 |
 | Softmax rowmax | `rtl/vfu/vfu_rowmax16.v` | `IMPLEMENTED`, `RTL_SIM_PASS` | 16×S24 rowmax와 scalar `key_valid_i`. 현재 directed row-unit TB PASS; 최종 독립 acceptance는 아직 OPEN |
 | QEXP commit + rowsum | `rtl/vfu/vfu_exp_commit16.v` | `IMPLEMENTED`, `RTL_SIM_PASS` | invalid key의 E=0과 16×U13 rowsum. 현재 directed row-unit TB PASS; `e_o`의 “E scratch” 주석은 stale |
-| V corner-turn | `rtl/vfu/vfu_vcorner_ff.sv` | `IMPLEMENTED`, `RTL_SIM_PASS`, `MASTER_ACCEPTED` | 2×16×16×S8 FF ping-pong, local column→row transpose, opaque 5-bit tag. Standalone simulation과 independent 128-seed stress 수락 |
-| Intermediate S-pad leaf | 예정 `rtl/vfu/vfu_spad_mem16.v` | `NOT_STARTED` | `16×512×32`, common-address 1R1W, `RD_LAT=1/2` 계약과 coder task만 READY. 현재 HEAD에는 source/TB 없음 |
+| V corner-turn | `rtl/vfu/vfu_vcorner_ff.sv` | `IMPLEMENTED`, `RTL_SIM_PASS`, `MASTER_ACCEPTED` | 2×16×16×S8 FF ping-pong, local column→row transpose, opaque 5-bit tag. `ce_i` 없는 standard ready/valid-only interface이며 transfer는 정확히 `valid&&ready`. Icarus 12.0 기본+128 seed와 Verilog-2005-SV 8 seed를 수락 |
+| Intermediate S-pad leaf | 예정 `rtl/vfu/vfu_spad_mem16.v` | `NOT_STARTED` (accepted Git evidence) | `16×512×32`, common-address 1R1W, `RD_LAT=1/2` 계약의 coder task는 `IN_PROGRESS`. 감사 commit에는 수락된 source/TB가 없음 |
 | CORE16/16-lane active wrapper | 예정 | `NOT_STARTED` | `vfu_core16/vfu_core_lane`, `vfu_coeff`, `vfu_input_unit`, active 16-lane POST wrapper와 coefficient/sideband alignment가 없음 |
 | 함수별 controller | 예정 | `NOT_STARTED` | RQ/GELU/Softmax/LayerNorm FSM과 얇은 dispatcher가 없음 |
 | Scratch typed integration | 예정 `vfu_scratch` | `NOT_STARTED` | Score/LN typed adapter, address overlay, side state, z→T lifecycle가 아직 OPEN |
@@ -87,15 +87,15 @@ V transpose leaf
 CI workflow가 없습니다. Wildcard로 `rtl/vfu/**/*.v`를 compile하면 draft의 중복 module 또는
 stale interface가 섞일 수 있으므로, 통합 전 explicit source manifest가 필요합니다.
 
-## 5. 2026-08-27 재현 결과
+## 5. 2026-08-27~28 재현 결과
 
 ### 5.1 RTL
 
 | 대상 | 결과 | 범위 |
 |---|---|---|
 | `tb_vfu_row_units` | `PASS` | reverse key order 15→0, `seq_len=5`, invalid-key E mask, rowmax/rowsum directed check |
-| `tb_vfu_vcorner_ff` | `PASS` | 기본 seed 10 groups/160 beats, permutation, tag, CE/output stall, simultaneous fill/drain |
-| V-corner independent stress | `PASS` | 앞선 Master acceptance의 추가 128-seed standalone simulation |
+| `tb_vfu_vcorner_ff` | `PASS` | Icarus 12.0, standard `valid&&ready`, 기본 seed 10 groups/160 beats, permutation, tag, directed input/output backpressure, randomized output backpressure, simultaneous fill/drain |
+| V-corner independent stress | `PASS` | `-g2012 -Wall` 128 seed와 `-g2005-sv -Wall` 추가 8 seed; mismatch/drop/duplicate/reorder/cross-tag 0 |
 | `tb_vfu_pre_alu16` | `BUILD_BLOCKED` | `vfu_defs.vh` not found |
 | `tb_vfu_post_alu_lane` | `BUILD_BLOCKED` | `vfu_defs.vh` not found |
 | `tb_vfu_dsp_lane` | `BUILD_BLOCKED` | `vfu_defs.vh` not found; 이후 primitive elaboration은 평가하지 않음 |
@@ -110,6 +110,10 @@ Row-unit TB의 현재 PASS는 기본 동작 증거입니다. 다음 항목은 �
 
 또한 이 TB의 failure branch는 `$fatal` 대신 `FAIL`을 출력하고 `$finish`하므로, 자동화할
 때는 출력 문자열을 검사하거나 TB를 exit-failing 형태로 강화해야 합니다.
+
+V-corner의 과거 commit `d41d7da...`와 당시 128-seed PASS는
+`fire=ce_i&&valid&&ready`인 legacy custom protocol에만 유효합니다. Standard ready/valid
+수락 근거는 `afb6e42...`의 RTL/TB와 위 2026-08-28 재실행 결과입니다.
 
 ### 5.2 Model / NN-LUT tools
 
@@ -164,8 +168,9 @@ GELU/QEXP/RSQRT의 최종 production coefficient bundle/manifest와 RTL coeffici
 | padded BERT-Tiny E2E RTL/model equivalence | `NOT_STARTED` |
 | KV260 hardware execution | `NOT_STARTED` |
 
-이번 환경의 PATH에는 Vivado/XSim, Verilator, Yosys가 없었고 repository에도 synthesis
-script/report가 없었습니다. 따라서 source attribute나 `DSP48E2` instantiation만 보고
+이번 환경에는 Icarus 12.0 Ubuntu package를 격리 추출해 V-corner simulation을
+재현했습니다. Vivado/XSim, Verilator, Yosys는 없었고 repository에도 production synthesis
+script/report가 없습니다. 따라서 source attribute나 `DSP48E2` instantiation만 보고
 resource mapping 또는 timing을 추정하지 않습니다.
 
 따라서 현재 “VFU가 구현 완료됐다”라고 표현하면 안 됩니다. 정확한 표현은
@@ -174,7 +179,7 @@ Master acceptance를 받았으며 controller/memory/commit/top integration은 �
 
 ## 8. 다음 구현 경계
 
-현재 발행된 다음 task는 schedule-independent S-pad memory leaf입니다.
+현재 진행 중인 다음 task는 schedule-independent S-pad memory leaf입니다.
 
 ```text
 rtl/vfu/vfu_spad_mem16.v
