@@ -7,7 +7,6 @@ module tb_vfu_vcorner_ff;
 
     reg clk_i = 1'b0;
     reg rst_ni = 1'b0;
-    reg ce_i = 1'b1;
 
     reg         in_valid_i = 1'b0;
     wire        in_ready_o;
@@ -48,8 +47,9 @@ module tb_vfu_vcorner_ff;
     integer expected_output_row;
     integer last_input_fire_cycle;
     integer simultaneous_cycles;
+    integer input_stall_cycles;
     integer output_stall_cycles;
-    integer ce_low_cycles;
+    integer random_output_stall_cycles;
 
     integer producer_beat_count;
     reg [15:0] producer_seen;
@@ -65,8 +65,8 @@ module tb_vfu_vcorner_ff;
     wire selected_write_full;
     wire selected_read_full;
 
-    assign input_fire = ce_i && in_valid_i && in_ready_o;
-    assign output_fire = ce_i && out_valid_o && out_ready_i;
+    assign input_fire = in_valid_i && in_ready_o;
+    assign output_fire = out_valid_o && out_ready_i;
 
     assign selected_write_full = u_dut.write_bank_r
                                ? u_dut.bank_1_full_r
@@ -80,7 +80,6 @@ module tb_vfu_vcorner_ff;
     vfu_vcorner_ff u_dut (
         .clk_i(clk_i),
         .rst_ni(rst_ni),
-        .ce_i(ce_i),
         .in_valid_i(in_valid_i),
         .in_ready_o(in_ready_o),
         .in_col_i(in_col_i),
@@ -126,17 +125,16 @@ module tb_vfu_vcorner_ff;
     endtask
 
     // Keep the first two groups as one uninterrupted 32-beat input burst.
-    // Thereafter, independently exercise global CE and output backpressure.
+    // Then hold the output long enough to fill both banks and force input
+    // backpressure.  Randomized output backpressure follows that directed case.
     always @(negedge clk_i) begin
         if (!rst_ni) begin
-            ce_i = 1'b1;
             out_ready_i = 1'b1;
         end else if (input_accept_count < 32) begin
-            ce_i = 1'b1;
             out_ready_i = 1'b1;
+        end else if (input_accept_count < 48) begin
+            out_ready_i = 1'b0;
         end else begin
-            control_random = $random(control_seed);
-            ce_i = (control_random[2:0] != 3'd0);
             control_random = $random(control_seed);
             out_ready_i = (control_random[1:0] != 2'd0);
         end
@@ -153,11 +151,9 @@ module tb_vfu_vcorner_ff;
             producer_tag = 5'd0;
             input_hold_pending = 1'b0;
             input_hold_bundle = 138'd0;
+            input_stall_cycles = 0;
         end else begin
             cycle_count = cycle_count + 1;
-
-            if (!ce_i)
-                ce_low_cycles = ce_low_cycles + 1;
 
             if (input_hold_pending &&
                 ({in_valid_i, in_col_i, in_tag_i, in_data_i}
@@ -204,6 +200,7 @@ module tb_vfu_vcorner_ff;
             end
 
             if (in_valid_i && !input_fire) begin
+                input_stall_cycles = input_stall_cycles + 1;
                 input_hold_pending = 1'b1;
                 input_hold_bundle = {in_valid_i, in_col_i, in_tag_i, in_data_i};
             end else begin
@@ -220,6 +217,7 @@ module tb_vfu_vcorner_ff;
             expected_output_row = 0;
             simultaneous_cycles = 0;
             output_stall_cycles = 0;
+            random_output_stall_cycles = 0;
             output_hold_pending = 1'b0;
             output_hold_bundle = 139'd0;
         end else begin
@@ -309,6 +307,8 @@ module tb_vfu_vcorner_ff;
 
             if (out_valid_o && !output_fire) begin
                 output_stall_cycles = output_stall_cycles + 1;
+                if (input_accept_count >= 48)
+                    random_output_stall_cycles = random_output_stall_cycles + 1;
                 output_hold_pending = 1'b1;
                 output_hold_bundle = {out_valid_o, out_data_o, out_row_o,
                                       out_tag_o, out_last_o};
@@ -325,7 +325,6 @@ module tb_vfu_vcorner_ff;
         seed = test_seed;
         control_seed = test_seed ^ 32'h27d4eb2d;
         random_value = $urandom(seed);
-        ce_low_cycles = 0;
 
         for (group_idx = 0; group_idx < 32; group_idx = group_idx + 1)
             tag_pool[group_idx] = group_idx;
@@ -403,12 +402,16 @@ module tb_vfu_vcorner_ff;
             $display("FAIL: no simultaneous different-bank fill/drain observed");
             errors = errors + 1;
         end
-        if (output_stall_cycles == 0) begin
-            $display("FAIL: randomized output backpressure was not observed");
+        if (input_stall_cycles == 0) begin
+            $display("FAIL: directed input backpressure was not observed");
             errors = errors + 1;
         end
-        if (ce_low_cycles == 0) begin
-            $display("FAIL: CE stall was not observed");
+        if (output_stall_cycles == 0) begin
+            $display("FAIL: output backpressure was not observed");
+            errors = errors + 1;
+        end
+        if (random_output_stall_cycles == 0) begin
+            $display("FAIL: randomized output backpressure was not observed");
             errors = errors + 1;
         end
         if (!idle_o) begin
@@ -417,9 +420,10 @@ module tb_vfu_vcorner_ff;
         end
 
         if (errors == 0) begin
-            $display("PASS: vfu_vcorner_ff seed=%0d groups=%0d beats=%0d simultaneous=%0d output_stalls=%0d ce_stalls=%0d",
+            $display("PASS: vfu_vcorner_ff seed=%0d groups=%0d beats=%0d simultaneous=%0d input_stalls=%0d output_stalls=%0d random_output_stalls=%0d",
                      test_seed, NUM_GROUPS, TOTAL_BEATS, simultaneous_cycles,
-                     output_stall_cycles, ce_low_cycles);
+                     input_stall_cycles, output_stall_cycles,
+                     random_output_stall_cycles);
             $finish;
         end else begin
             $fatal(1, "FAIL: vfu_vcorner_ff errors=%0d", errors);

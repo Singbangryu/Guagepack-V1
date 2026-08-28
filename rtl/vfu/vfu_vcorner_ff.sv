@@ -9,7 +9,6 @@
 module vfu_vcorner_ff (
     input  wire         clk_i,
     input  wire         rst_ni,
-    input  wire         ce_i,
 
     // Feature-column input: 16 token lanes for one local feature.
     input  wire         in_valid_i,
@@ -61,8 +60,10 @@ module vfu_vcorner_ff (
     assign in_ready_o  = ~write_bank_full_w;
     assign out_valid_o = read_bank_full_w;
 
-    assign input_fire_w  = ce_i && in_valid_i && in_ready_o;
-    assign output_fire_w = ce_i && out_valid_o && out_ready_i;
+    // Standard ready/valid contract: a transfer occurs exactly when both
+    // endpoints assert valid and ready on the same clock edge.
+    assign input_fire_w  = in_valid_i && in_ready_o;
+    assign output_fire_w = out_valid_o && out_ready_i;
 
     assign out_row_o = read_row_ptr_r;
     assign out_tag_o = read_bank_r ? bank_1_tag_r : bank_0_tag_r;
