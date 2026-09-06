@@ -1,5 +1,5 @@
 `timescale 1ns/1ps
-`include "vfu_defs.vh"
+`include "vfu_internal_op_defs.vh"
 
 // =============================================================================
 // GaugePack VFU DSP lane

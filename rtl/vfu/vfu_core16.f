@@ -1,0 +1,11 @@
+// Run from the repository root. Supply the simulator's DSP48E2 library/glbl.
+// NN-LUT remains an intentionally empty wrapper in the CORE16 draft.
++incdir+rtl/vfu
+rtl/vfu/gaugepack_vfu_segment_gen.v
+rtl/vfu/vfu_pre_alu16_s0.v
+rtl/vfu/vfu_dsp16_s1s2.v
+rtl/vfu/post_alu/vfu_rne_shift48.v
+rtl/vfu/post_alu/vfu_clamp_wrapper.v
+rtl/vfu/post_alu/vfu_residual_add.v
+rtl/vfu/post_alu/vfu_post_alu16_s3.v
+rtl/vfu/vfu_draft/vfu_core16_draft.v

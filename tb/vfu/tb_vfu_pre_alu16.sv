@@ -1,5 +1,5 @@
 `timescale 1ns/1ps
-`include "vfu_defs.vh"
+`include "vfu_internal_op_defs.vh"
 
 module tb_vfu_pre_alu16;
     reg clk_i = 1'b0;
