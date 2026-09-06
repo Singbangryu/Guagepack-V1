@@ -1,14 +1,7 @@
 `timescale 1ns/1ps
 `include "vfu_internal_op_defs.vh"
 
-// Arithmetic-only draft; no memory, address generator, or command controller.
-// Stage modules: vfu_pre_alu16, vfu_dsp16, vfu_post_alu16_s3.
-// Stage modules own all arithmetic registers. CORE16 owns sideband alignment.
-// Keep one op/phase until drain, except the Moment INIT -> ACC transition.
-// page_id_i stays stable until drain. PAGE_ID_W is an opaque draft parameter.
-// The controller supplies INIT on the first accepted Moment beat, then ACC;
-// last_i marks the final beat of that reduction. Do not interleave reductions.
-module vfu_core16_draft #(
+module vfu_core16 #(
     parameter PAGE_ID_W = 8
 ) (
     input  wire                    clk_i,
@@ -26,18 +19,13 @@ module vfu_core16_draft #(
     input  wire [127:0]            rsqrted_i,
     input  wire [PAGE_ID_W-1:0]     page_id_i,
 
-    // RD_LAT=1 memory output, available alongside the DSP's S1 item.
-    // E0: S0 loaded -> E1: memory response -> E2: skip_s2_q -> E3: POST.
     input  wire [127:0]            skip_s1_i,
 
-    // Tap for an external skip request helper; no extra registers here.
     output wire                    s0_valid_o,
     output wire [3:0]              s0_op_o,
     output wire [8:0]              s0_feature_o,
     output wire [3:0]              s0_token_tile_o,
 
-    // Registered S3 result. Each lane keeps its operation-specific S32/U32
-    // container. lane_valid_o is metadata; final byte masking is downstream.
     output wire                    valid_o,
     output wire [3:0]              op_o,
     output wire [8:0]              feature_o,
@@ -47,7 +35,6 @@ module vfu_core16_draft #(
     output wire                    last_o,
     output wire [511:0]            data_o,
 
-    // Final Moment fields only; no persistent per-tile state bank here.
     output wire                    moment_capture_o,
     output wire [255:0]            moment_s_o,
     output wire [367:0]            moment_q_o
@@ -72,9 +59,7 @@ module vfu_core16_draft #(
     reg [3:0] token_tile_s0_q;
     reg key_valid_s0_q, last_s0_q;
 
-    // Page headers feed PRE combinationally before the S0 edge.
-    // M/C/shamt lookup uses registered S0 feature/segment addresses.
-    vfu_coeff_page16_draft #(.PAGE_ID_W(PAGE_ID_W)) u_coeff_page (
+    vfu_coeff_page16 #(.PAGE_ID_W(PAGE_ID_W)) u_coeff_page (
         .page_id_i       (page_id_i),
         .op_s0_i         (op_s0),
         .feature_s0_i    (feature_s0),
@@ -92,7 +77,6 @@ module vfu_core16_draft #(
     vfu_pre_alu16 u_pre (
         .clk_i           (clk_i),
         .rst_ni          (rst_ni),
-        .ce_i            (1'b1),
         .valid_i         (valid_i),
         .op_i            (op_i),
         .feature_i       (feature_i),
@@ -122,7 +106,7 @@ module vfu_core16_draft #(
         end else if (valid_i) begin
             token_tile_s0_q <= token_tile_i;
             key_valid_s0_q  <= key_valid_i;
-            last_s0_q      <= last_i;
+            last_s0_q       <= last_i;
         end
     end
 
@@ -131,7 +115,6 @@ module vfu_core16_draft #(
     assign s0_feature_o    = feature_s0;
     assign s0_token_tile_o = token_tile_s0_q;
 
-    // S1 operand selection is COMBINATIONAL. The DSP owns the S1 registers.
     reg [287:0] dsp_b;
     reg [767:0] dsp_c;
     reg [95:0] shamt_s0;
@@ -154,16 +137,16 @@ module vfu_core16_draft #(
             end
             `VFU_OP_SM_CONTEXT: shamt_s0 = {16{6'd23}};
             `VFU_OP_LN_D:       shamt_s0 = {16{6'd4}};
-            default: begin end // Moment and LN_NORM keep PRE operands/raw P.
+            default: begin end
         endcase
     end
 
     reg valid_s1_q;
-    // {feature[8:0], tile[3:0], lane_valid[15:0], key_valid, last}
+
     reg [30:0] meta_s1_q, meta_s2_q;
     reg [95:0] shamt_s1_q, shamt_s2_q;
     reg [31:0] range_s1_q, range_s2_q;
-    reg [15:0] tails_s1_q, tails_s2_q; // {low_code, high_code}
+    reg [15:0] tails_s1_q, tails_s2_q;
     reg [127:0] skip_s2_q;
 
     always @(posedge clk_i) begin
@@ -208,11 +191,9 @@ module vfu_core16_draft #(
     assign {feature_s2, token_tile_s2, lane_valid_s2, key_valid_s2, last_s2}
         = meta_s2_q;
 
-    // S1 input/control registers and S2 PREG are inside the DSP16 stage.
     vfu_dsp16 u_dsp (
         .clk_i   (clk_i),
         .rst_ni  (rst_ni),
-        .ce_i    (1'b1),
         .valid_i (valid_s0),
         .op_i    (op_s0),
         .a_i     (a_s0),
@@ -223,7 +204,6 @@ module vfu_core16_draft #(
         .p_o     (p_s2)
     );
 
-    // POST16 owns the S3 boundary, including final Moment S/Q capture.
     vfu_post_alu16_s3 u_post (
         .clk_i            (clk_i),
         .rst_ni           (rst_ni),
@@ -252,29 +232,4 @@ module vfu_core16_draft #(
         .moment_s_o       (moment_s_o),
         .moment_q_o       (moment_q_o)
     );
-endmodule
-
-// Intentionally empty NN-LUT / coefficient-page wrapper.
-// Header outputs depend on the selected phase page, not on op_s0_i.
-// Lookup outputs are combinational from page + registered S0 op/feature/segment.
-// RQ/RQ_RES/LN_AFFINE broadcast common-feature coefficients to all lanes;
-// GELU/QEXP/RECIP/RSQRT select coefficients independently by lane segment.
-// No output is driven yet: coefficient-dependent results are undefined.
-module vfu_coeff_page16_draft #(
-    parameter PAGE_ID_W = 8
-) (
-    input  wire [PAGE_ID_W-1:0] page_id_i,
-    input  wire [3:0]          op_s0_i,
-    input  wire [8:0]          feature_s0_i,
-    input  wire [63:0]         seg_addr_s0_i,
-    output wire [404:0]        boundary_flat_o,
-    output wire signed [26:0]  x_min_o,
-    output wire signed [26:0]  x_max_o,
-    output wire [7:0]          low_code_o,
-    output wire [7:0]          high_code_o,
-    output wire [287:0]        m_o,
-    output wire [767:0]        c_o,
-    output wire [95:0]         shamt_o
-);
-    // TODO: active-page storage and combinational coefficient lookup.
 endmodule

@@ -225,7 +225,6 @@ endmodule
 module vfu_pre_alu16 (
     input  wire                    clk_i,
     input  wire                    rst_ni,
-    input  wire                    ce_i,
 
     input  wire                    valid_i,
     input  wire [3:0]              op_i,
@@ -294,7 +293,7 @@ module vfu_pre_alu16 (
             c_o          <= 768'd0;
             seg_addr_o   <= 64'd0;
             seg_range_o  <= 32'd0;
-        end else if (ce_i) begin
+        end else begin
             valid_o      <= valid_i;
             op_o         <= op_i;
             feature_o    <= feature_i;

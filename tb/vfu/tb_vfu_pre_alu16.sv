@@ -4,7 +4,6 @@
 module tb_vfu_pre_alu16;
     reg clk_i = 1'b0;
     reg rst_ni = 1'b0;
-    reg ce_i = 1'b1;
     reg valid_i = 1'b0;
     reg [3:0] op_i = 4'd0;
     reg [8:0] feature_i = 9'd0;
@@ -32,7 +31,7 @@ module tb_vfu_pre_alu16;
     always #5 clk_i = ~clk_i;
 
     vfu_pre_alu16 dut (
-        .clk_i(clk_i), .rst_ni(rst_ni), .ce_i(ce_i),
+        .clk_i(clk_i), .rst_ni(rst_ni),
         .valid_i(valid_i), .op_i(op_i), .feature_i(feature_i),
         .lane_valid_i(lane_valid_i), .src0_i(src0_i), .src1_i(src1_i),
         .rsqrted_i(rsqrted_i), .boundary_flat_i(boundary_flat_i),

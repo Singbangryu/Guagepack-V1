@@ -9,7 +9,6 @@ module tb_vfu_stage16;
     always #5 clk = ~clk;
     reg rst_n = 1'b0;
 
-    reg dsp_ce = 1'b1;
     reg dsp_valid = 1'b0;
     reg [3:0] dsp_op = 4'hf;
     reg [431:0] a = 432'd0;
@@ -23,7 +22,7 @@ module tb_vfu_stage16;
     wire [767:0] dsp_p_ref;
 
     vfu_dsp16 u_dsp16 (
-        .clk_i(clk), .rst_ni(rst_n), .ce_i(dsp_ce),
+        .clk_i(clk), .rst_ni(rst_n),
         .valid_i(dsp_valid), .op_i(dsp_op), .a_i(a), .b_i(b), .c_i(c),
         .valid_o(dsp_valid_new), .op_o(dsp_op_new), .p_o(dsp_p_new)
     );
@@ -71,7 +70,7 @@ module tb_vfu_stage16;
     generate
         for (lane = 0; lane < 16; lane = lane + 1) begin : GEN_REFERENCE
             vfu_dsp_lane u_dsp_lane (
-                .clk_i(clk), .rst_ni(rst_n), .ce_i(dsp_ce),
+                .clk_i(clk), .rst_ni(rst_n), .ce_i(1'b1),
                 .valid_i(dsp_valid), .op_i(dsp_op),
                 .a_i($signed(a[lane*27 +: 27])),
                 .b_i($signed(b[lane*18 +: 18])),
@@ -155,7 +154,6 @@ module tb_vfu_stage16;
         rst_n = 1'b1;
         for (cycle = 0; cycle < 512; cycle = cycle + 1) begin
             rst_n = (cycle % 137 != 90);
-            dsp_ce = (cycle % 7 != 3);
             dsp_valid = (cycle % 5 != 2);
             dsp_op = cycle % 12;
             post_valid = (cycle % 4 != 2);
@@ -182,7 +180,6 @@ module tb_vfu_stage16;
             @(negedge clk);
         end
         rst_n = 1'b1;
-        dsp_ce = 1'b1;
         dsp_valid = 1'b0;
         post_valid = 1'b0;
         repeat (4) begin

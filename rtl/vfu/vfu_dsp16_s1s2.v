@@ -2,13 +2,10 @@
 `include "vfu_internal_op_defs.vh"
 
 // Sixteen parallel DSP48E2 lanes. S1=input/control registers; S2=PREG.
-// Common valid/op control is identical for every lane. ce_i is retained for
-// leaf compatibility; the free-running CORE16 draft ties it to 1'b1.
 // Lane arithmetic is inlined here; no vfu_dsp_lane dependency.
 module vfu_dsp16 (
     input  wire         clk_i,
     input  wire         rst_ni,
-    input  wire         ce_i,
     input  wire         valid_i,
     input  wire [3:0]   op_i,
     input  wire [431:0] a_i,  // 16 x S27
@@ -76,7 +73,7 @@ module vfu_dsp16 (
 
     // Capture only real items into S1.  A bubble leaves the DSP input/control
     // registers untouched and is represented only by valid_s1_q=0.
-    wire ce_s1_w = ce_i && valid_i;
+    wire ce_s1_w = valid_i;
 
     // PREG must update only when the item currently resident in S1 is valid.
     // This is important for MOMENT_ACC: a bubble must hold P, not accumulate
@@ -84,7 +81,7 @@ module vfu_dsp16 (
     reg valid_s1_q;
     reg [3:0] op_s1_q;
 
-    wire ce_p_w = ce_i && valid_s1_q;
+    wire ce_p_w = valid_s1_q;
 
     always @(posedge clk_i) begin
         if (!rst_ni) begin
@@ -92,7 +89,7 @@ module vfu_dsp16 (
             op_s1_q    <= 4'd0;
             valid_o    <= 1'b0;
             op_o       <= 4'd0;
-        end else if (ce_i) begin
+        end else begin
             valid_s1_q <= valid_i;
             valid_o    <= valid_s1_q;
 
