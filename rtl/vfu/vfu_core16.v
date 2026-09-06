@@ -37,7 +37,7 @@ module vfu_core16 #(
 
     output wire                    moment_capture_o,
     output wire [255:0]            moment_s_o,
-    output wire [367:0]            moment_q_o
+    output wire [367:0]            moment_r_o
 );
 
     wire [404:0] boundary_flat;
@@ -56,8 +56,8 @@ module vfu_core16 #(
     wire [767:0] c_s0;
     wire [63:0] seg_addr_s0;
     wire [31:0] range_s0;
-    reg [3:0] token_tile_s0_q;
-    reg key_valid_s0_q, last_s0_q;
+    reg [3:0] token_tile_s0_r;
+    reg key_valid_s0_r, last_s0_r;
 
     vfu_coeff_page16 #(.PAGE_ID_W(PAGE_ID_W)) u_coeff_page (
         .page_id_i       (page_id_i),
@@ -100,20 +100,20 @@ module vfu_core16 #(
 
     always @(posedge clk_i) begin
         if (!rst_ni) begin
-            token_tile_s0_q <= 4'd0;
-            key_valid_s0_q  <= 1'b0;
-            last_s0_q       <= 1'b0;
+            token_tile_s0_r <= 4'd0;
+            key_valid_s0_r  <= 1'b0;
+            last_s0_r       <= 1'b0;
         end else if (valid_i) begin
-            token_tile_s0_q <= token_tile_i;
-            key_valid_s0_q  <= key_valid_i;
-            last_s0_q       <= last_i;
+            token_tile_s0_r <= token_tile_i;
+            key_valid_s0_r  <= key_valid_i;
+            last_s0_r       <= last_i;
         end
     end
 
     assign s0_valid_o      = valid_s0;
     assign s0_op_o         = op_s0;
     assign s0_feature_o    = feature_s0;
-    assign s0_token_tile_o = token_tile_s0_q;
+    assign s0_token_tile_o = token_tile_s0_r;
 
     reg [287:0] dsp_b;
     reg [767:0] dsp_c;
@@ -125,7 +125,7 @@ module vfu_core16 #(
         shamt_s0 = 96'd0;
         case (op_s0)
             `VFU_OP_RQ, `VFU_OP_RQ_RES, `VFU_OP_GELU,
-            `VFU_OP_QEXP, `VFU_OP_LN_RSQRT, `VFU_OP_LN_AFFINE: begin
+            `VFU_OP_rEXP, `VFU_OP_LN_RSQRT, `VFU_OP_LN_AFFINE: begin
                 dsp_b    = coeff_m_s0;
                 dsp_c    = coeff_c_s0;
                 shamt_s0 = coeff_shamt_s0;
@@ -141,41 +141,41 @@ module vfu_core16 #(
         endcase
     end
 
-    reg valid_s1_q;
+    reg valid_s1_r;
 
-    reg [30:0] meta_s1_q, meta_s2_q;
-    reg [95:0] shamt_s1_q, shamt_s2_q;
-    reg [31:0] range_s1_q, range_s2_q;
-    reg [15:0] tails_s1_q, tails_s2_q;
-    reg [127:0] skip_s2_q;
+    reg [30:0] meta_s1_r, meta_s2_r;
+    reg [95:0] shamt_s1_r, shamt_s2_r;
+    reg [31:0] range_s1_r, range_s2_r;
+    reg [15:0] tails_s1_r, tails_s2_r;
+    reg [127:0] skip_s2_r;
 
     always @(posedge clk_i) begin
         if (!rst_ni) begin
-            valid_s1_q <= 1'b0;
-            meta_s1_q  <= 31'd0;
-            meta_s2_q  <= 31'd0;
-            shamt_s1_q <= 96'd0;
-            shamt_s2_q <= 96'd0;
-            range_s1_q <= 32'd0;
-            range_s2_q <= 32'd0;
-            tails_s1_q <= 16'd0;
-            tails_s2_q <= 16'd0;
-            skip_s2_q  <= 128'd0;
+            valid_s1_r <= 1'b0;
+            meta_s1_r  <= 31'd0;
+            meta_s2_r  <= 31'd0;
+            shamt_s1_r <= 96'd0;
+            shamt_s2_r <= 96'd0;
+            range_s1_r <= 32'd0;
+            range_s2_r <= 32'd0;
+            tails_s1_r <= 16'd0;
+            tails_s2_r <= 16'd0;
+            skip_s2_r  <= 128'd0;
         end else begin
-            valid_s1_q <= valid_s0;
+            valid_s1_r <= valid_s0;
             if (valid_s0) begin
-                meta_s1_q <= {feature_s0, token_tile_s0_q, lane_valid_s0,
-                              key_valid_s0_q, last_s0_q};
-                shamt_s1_q <= shamt_s0;
-                range_s1_q <= range_s0;
-                tails_s1_q <= {low_code, high_code};
+                meta_s1_r <= {feature_s0, token_tile_s0_r, lane_valid_s0,
+                              key_valid_s0_r, last_s0_r};
+                shamt_s1_r <= shamt_s0;
+                range_s1_r <= range_s0;
+                tails_s1_r <= {low_code, high_code};
             end
-            if (valid_s1_q) begin
-                meta_s2_q  <= meta_s1_q;
-                shamt_s2_q <= shamt_s1_q;
-                range_s2_q <= range_s1_q;
-                tails_s2_q <= tails_s1_q;
-                skip_s2_q  <= skip_s1_i;
+            if (valid_s1_r) begin
+                meta_s2_r  <= meta_s1_r;
+                shamt_s2_r <= shamt_s1_r;
+                range_s2_r <= range_s1_r;
+                tails_s2_r <= tails_s1_r;
+                skip_s2_r  <= skip_s1_i;
             end
         end
     end
@@ -189,7 +189,7 @@ module vfu_core16 #(
     wire key_valid_s2, last_s2;
 
     assign {feature_s2, token_tile_s2, lane_valid_s2, key_valid_s2, last_s2}
-        = meta_s2_q;
+        = meta_s2_r;
 
     vfu_dsp16 u_dsp (
         .clk_i   (clk_i),
@@ -215,11 +215,11 @@ module vfu_core16 #(
         .key_valid_i      (key_valid_s2),
         .last_i           (last_s2),
         .p_i              (p_s2),
-        .shamt_i          (shamt_s2_q),
-        .range_i          (range_s2_q),
-        .low_code_i       (tails_s2_q[15:8]),
-        .high_code_i      (tails_s2_q[7:0]),
-        .skip_i           (skip_s2_q),
+        .shamt_i          (shamt_s2_r),
+        .range_i          (range_s2_r),
+        .low_code_i       (tails_s2_r[15:8]),
+        .high_code_i      (tails_s2_r[7:0]),
+        .skip_i           (skip_s2_r),
         .valid_o          (valid_o),
         .op_o             (op_o),
         .feature_o        (feature_o),
@@ -230,6 +230,6 @@ module vfu_core16 #(
         .data_o           (data_o),
         .moment_capture_o (moment_capture_o),
         .moment_s_o       (moment_s_o),
-        .moment_q_o       (moment_q_o)
+        .moment_r_o       (moment_r_o)
     );
 endmodule
