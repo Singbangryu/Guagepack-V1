@@ -37,7 +37,7 @@ module vfu_core16 #(
 
     output wire                    moment_capture_o,
     output wire [255:0]            moment_s_o,
-    output wire [367:0]            moment_r_o
+    output wire [367:0]            moment_q_o
 );
 
     wire [404:0] boundary_flat;
@@ -125,7 +125,7 @@ module vfu_core16 #(
         shamt_s0 = 96'd0;
         case (op_s0)
             `VFU_OP_RQ, `VFU_OP_RQ_RES, `VFU_OP_GELU,
-            `VFU_OP_rEXP, `VFU_OP_LN_RSQRT, `VFU_OP_LN_AFFINE: begin
+            `VFU_OP_QEXP, `VFU_OP_LN_RSQRT, `VFU_OP_LN_AFFINE: begin
                 dsp_b    = coeff_m_s0;
                 dsp_c    = coeff_c_s0;
                 shamt_s0 = coeff_shamt_s0;
@@ -230,6 +230,6 @@ module vfu_core16 #(
         .data_o           (data_o),
         .moment_capture_o (moment_capture_o),
         .moment_s_o       (moment_s_o),
-        .moment_r_o       (moment_r_o)
+        .moment_q_o       (moment_q_o)
     );
 endmodule
