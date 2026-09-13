@@ -19,6 +19,10 @@ module vfu_core16 #(
     input  wire [127:0]            rsqrted_i,
     input  wire [PAGE_ID_W-1:0]     page_id_i,
 
+    // RQ/RQ_RES M/F: caller supplies before first valid and holds through drain.
+    input  wire signed [17:0]      req_mult_i,
+    input  wire [5:0]              req_shamt_i,
+
     input  wire [127:0]            skip_s1_i,
 
     output wire                    s0_valid_o,
@@ -124,7 +128,12 @@ module vfu_core16 #(
         dsp_c    = c_s0;
         shamt_s0 = 96'd0;
         case (op_s0)
-            `VFU_OP_RQ, `VFU_OP_RQ_RES, `VFU_OP_GELU,
+            `VFU_OP_RQ, `VFU_OP_RQ_RES: begin
+                dsp_b    = {16{req_mult_i}};
+                dsp_c    = 768'd0;
+                shamt_s0 = {16{req_shamt_i}};
+            end
+            `VFU_OP_GELU,
             `VFU_OP_QEXP, `VFU_OP_LN_RSQRT, `VFU_OP_LN_AFFINE: begin
                 dsp_b    = coeff_m_s0;
                 dsp_c    = coeff_c_s0;
