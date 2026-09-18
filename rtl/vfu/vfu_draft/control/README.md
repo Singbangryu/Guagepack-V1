@@ -1,9 +1,10 @@
-# VFU 공통 / Softmax 컨트롤 초안
+# VFU 공통 / Softmax / LayerNorm 컨트롤 초안
 
 공통 명령 제어와 함수별 실행 제어를 연결해 보는 **draft RTL**이다. 실제 `VFU_TOP`, CORE 연산,
 메모리 또는 commit 경로를 완성한 코드는 아니다. 기존 production manifest에는 넣지 않는다.
 `tb_vfu_control_hierarchy_draft.sv`에 common + 기존 RQ/GELU + Softmax의 named-port 연결 예시가 있다.
-LN은 완료 입력만 연결할 자리를 두었으며, LN 컨트롤러 구현은 포함하지 않는다.
+`tb_vfu_ln_hierarchy_draft.sv`는 여기에 실제 LN 제어와 rho 저장 helper를 연결한다.
+두 예제 모두 데이터 연산과 메모리 완료는 명시적인 boundary model이다.
 
 ## 읽는 순서와 역할
 
@@ -13,6 +14,9 @@ LN은 완료 입력만 연결할 자리를 두었으며, LN 컨트롤러 구현�
 | 기존 `rtl/vfu/vfu_rq_gelu_control.v` | Owner의 기존 `STREAM → DRAIN`; 수정 없이 사용 |
 | `vfu_softmax_control_draft.v` | SM의 score/MAX → QEXP/E/L → reciprocal/R, 별도 SM_NL의 context 처리 순서 |
 | `tb/vfu/vfu_draft/control/tb_vfu_control_hierarchy_draft.sv` | 세 컨트롤러 연결, 선택된 opcode/완료 전달, R 수명 확인 |
+| `vfu_ln_control_draft.v` | LN 입력 저장 후 tile별 Moment → D → RSQRT → NORM → AFFINE 제어 |
+| `vfu_ln_rho16_draft.v` | 현재 LN tile의 16×U8 rho, tile tag, valid 저장 |
+| `tb/vfu/vfu_draft/control/tb_vfu_ln_hierarchy_draft.sv` | common/RQ/SM/LN/rho 연결, `SM → LN → SM_NL`, 별도 R과 rho 수명 확인 |
 
 공통 제어는 하위 phase를 다시 추적하지 않는다. RQ/GELU는 저장된 외부 op를 내부 RQ/GELU op로
 정적으로 바꾸고, Softmax는 자신의 phase에 따라 QEXP/RECIP/CONTEXT op를 낸다. 공유 wrapper가
@@ -123,6 +127,117 @@ write edge와 rowmax 입력이 같은 `score_fire`를 사용한다. 지연된 wr
   state FF의 조합 read를 가정하며, 실제 read latency가 다르면 adapter가 operand를 정렬해야 한다.
   feature 좌표/중복 여부, lane mask, memory address와 최종 tensor coverage는 wrapper/TB 책임이다.
 
+## LayerNorm 순서
+
+LN은 N=128, MT=1..4를 전제로 한다. 먼저 명령 전체의 `MT*128` RQ_RES 결과 z를
+scratch에 저장한 뒤, tile 0부터 차례로 아래 연산을 한다. 최대 512 vector word를 사용하고,
+NORM에서 다 읽은 z 위치를 T로 덮어쓰는 **초안 schedule**이다. 별도 full-command T bank를
+추가하지 않는다. 실제 read/write adapter 및 배치는 아직 구현하지 않았다.
+
+| 제어 구간 | CORE op | launch 수 | 다음 구간으로 가는 사건 |
+|---|---|---:|---|
+| RQ_STREAM → RQ_DRAIN | RQ_RES | 명령 전체 MT×128 | 마지막 z write와 이전 write가 모두 완료 |
+| MOMENT_INIT → INIT_DRAIN | LN_MOMENT_INIT | tile당 1 | INIT 결과가 실제 S3에서 retire |
+| MOMENT_ACC → MOMENT_DRAIN | LN_MOMENT_ACC | tile당 127 | 마지막 Moment의 S/Q capture |
+| D_REQUEST → D_DRAIN | LN_D | tile당 1 | 해당 tile의 D 결과 도착 |
+| RSQRT_REQUEST → RSQRT_DRAIN | LN_RSQRT | tile당 1 | rho helper가 해당 tile 결과를 저장 |
+| NORM_STREAM → NORM_DRAIN | LN_NORM | tile당 128 | 해당 tile의 마지막 T write 완료 |
+| AFFINE_STREAM → AFFINE_DRAIN | LN_AFFINE | tile당 128 | tile 최종 write 완료; 마지막 tile은 command commit_done도 필요 |
+
+INIT는 feature 0 한 개, ACC는 feature 1..127을 처리한다. INIT와 ACC 사이에 실제 drain을
+두어 op/page를 유지한다. INIT의 last는 0이고 S/Q capture를 발생시키지 않는다. ACC의 마지막
+feature에서만 Moment last를 보낸다. 마지막 tile AFFINE의 tile-done과 command commit-done은
+서로 다른 cycle에 올 수 있으며 둘 다 확인해야 LN done이다. 공통 controller는 그동안 LN active,
+설정과 busy를 유지하고 하위 phase를 직접 세지 않는다.
+
+Replay는 tile당 네 burst로 분리한다. `replay_start`는 항상 수락되는 요청이며 별도 ready가 없다.
+반환은 요청 뒤 정확히 아래 수만큼 오름차순으로 온다. 중간 bubble은 가능하지만 INIT drain을
+넘어 미리 읽어 온 ACC 데이터를 보관하는 숨은 buffer를 전제하지 않는다.
+
+| Replay pass | start feature | 요청 beats |
+|---|---:|---:|
+| Moment INIT | 0 | 1 |
+| Moment ACC | 1 | 127 |
+| NORM | 0 | 128 |
+| AFFINE | 0 | 128 |
+
+### LN control과 rho helper 포트
+
+아래 포트는 외부 system TOP 핀이 아니라 VFU 내부 draft 연결이다.
+
+| LN control port/group | I/O | Width | Description |
+|---|---|---:|---|
+| `clk_i`, `rst_ni`, `init_i`, `active_i` | I | 1 each | Clock, synchronous active-low reset, inactive setup initialization, selected execution. |
+| `mt_i` | I | 3 | Held tile count 1..4; features are fixed to 128. |
+| `rq_valid_i`, `z_store_done_i` | I | 1 each | Paired main/skip is ready; all command z writes have completed. |
+| `replay_valid_i` | I | 1 | Ordered current-burst vector and its required operands are ready. |
+| `init_retire_i`, `moment_capture_i` | I | 1 each | Tagged INIT S3 retirement; final ACC captured persistent S/Q. |
+| `scalar_ready_i`, `d_result_valid_i` | I | 1 each | Singleton operand-adapter readiness; current-tile D result is held. |
+| `rho_store_done_i`, `rho_match_valid_i` | I | 1 each | Registered rho capture event; stored rho matches current tile. |
+| `t_store_done_i`, `affine_tile_done_i`, `commit_done_i` | I | 1 each | Final T store, tile final architectural write, registered command final write. |
+| `rq_en_o`, `rq_fire_o`, `rq_last_o` | O | 1 each | Ingress permission, actual launch, command-final ingress marker. |
+| `replay_start_o`, `replay_en_o`, `replay_fire_o` | O | 1 each | Always-accepted burst request, return permission, actual replay launch. |
+| `replay_tile_o` | O | 2 | Current global token-tile index. |
+| `replay_start_feature_o`, `replay_feature_o`, `replay_beats_o` | O | 7, 7, 8 | Requested first feature, current return feature, requested count. |
+| `replay_first_o`, `replay_tile_last_o` | O | 1 each | Qualified first burst return and feature127 boundary. |
+| `scalar_valid_o`, `scalar_fire_o` | O | 1 each | D/RSQRT request and accepted singleton launch. |
+| `core_op_o`, `core_last_o`, `done_o` | O | 4, 1, 1 | Phase-selected op, qualified operation-specific last, final LN completion. |
+
+| Rho helper port/group | I/O | Width | Description |
+|---|---|---:|---|
+| `clk_i`, `rst_ni`, `clear_i` | I | 1 each | Clock, reset and LN-only initialization. |
+| `capture_i`, `capture_tile_i`, `capture_data_i` | I | 1, 2, 512 | Qualified LN_RSQRT retirement with aligned tile and sixteen zero-extended U8 containers. |
+| `rd_tile_i` | I | 2 | Requested current tile. |
+| `rho_o`, `match_valid_o`, `stored_o` | O | 128, 1, 1 | Packed rho; matching validity; registered one-cycle capture receipt. |
+
+LN replay는 request cycle 다음 STREAM부터 반환을 받는다. 완료 입력은 실제 positive-latency
+result/write 뒤 해당 drain에 전달한다. AFFINE의 tile/command 완료만 마지막 launch와 같은 cycle에
+관측된 경우도 모아 두지만, 일반 CORE/memory 연결에서 latency가 0이라는 뜻은 아니다.
+helper는 invalid/tag mismatch일 때 rho=0을 보이고, clear와 capture가 동시에 오면 simulation 오류다.
+
+### LN 데이터와 저장 수명
+
+| 연산 | CORE operand 연결 | 결과/수명 |
+|---|---|---|
+| RQ_RES | main S32, 별도로 정렬한 native-scale S8 skip, 공통의 held M/F와 C=0 | z:S9를 S32 container로 확장해 tagged scratch write |
+| Moment INIT/ACC | z; 기존 G23 MomentPack datapath | 마지막 ACC에서 기존 CORE의 S:S16/Q:U23 출력 capture |
+| D | lane별 S를 sign-extend해 src0, Q를 zero-extend해 src1 | CORE 결과 D27을 다음 RSQRT가 사용할 때까지 보존 |
+| RSQRT | D27과 해당 layer/site의 coefficient page | 실제 RSQRT 결과의 lane별 low byte를 rho helper에 저장 |
+| NORM | z→src0, 보존된 S→src1, rho→rsqrted | raw T:S25를 이미 읽은 z 위치에 저장 |
+| AFFINE | T와 feature별 M_gamma/C_beta/F | NARROW_S8 결과만 architectural commit 경로로 전달 |
+
+S/Q는 기존 CORE가 마지막 Moment 이후 유지하므로 이 초안은 별도 S/Q bank를 만들지 않는다.
+D도 CORE output이 다음 valid 결과까지 유지하는 것을 이용한다. 그러나 rho는 NORM 결과가
+CORE output을 바꾸어도 필요하므로 별도 128-bit register helper가 필요하다. rho는 한 tile만
+저장한다. 다음 tile의 rho로 교체하기 전 이전 tile의 NORM 사용이 모두 끝난다.
+
+`rho_o[lane*8 +: 8] = capture_data_i[lane*32 +: 8]`이다. 512-bit 결과의 low 128-bit를
+그대로 연결하면 네 lane의 container만 선택하므로 잘못된 연결이다. helper에는 실제 LN RSQRT
+S3 결과일 때만 capture를 넣고, 결과와 함께 지연된 tile tag를 넣는다. LN init/reset은 rho valid만
+무효화한다. **Softmax R은 다른 저장소**이며 LN init, LN 결과, rho capture가 이를 지우지 않는다.
+
+### LN adapter가 연결해야 하는 경계
+
+- 입력 `rq_valid`는 main과 skip이 실제 소비 경계에 정렬되어 준비됐다는 뜻이다. FIFO의
+  nonempty만 연결해서는 residual read latency가 해결되지 않는다. 실제 accepted ingress의
+  tile/feature tag를 z write까지 전달한다. 입력 feature 순서는 16개 단위 15→0이어도 된다.
+- replay 반환의 valid는 data, operand와 필요한 coefficient가 함께 준비됐다는 뜻이다.
+  scalar ready는 D/RSQRT singleton을 넣을 operand adapter의 준비를 뜻하며 CORE에 새 ready/CE를
+  추가하지 않는다. 모든 요청과 결과의 op/tile tag는 실제 파이프라인을 따라 정렬해야 한다.
+- INIT retire, final Moment capture, D valid, rho stored, T stored는 서로 다른 완료 사건이다.
+  NORM은 저장된 rho의 valid와 현재 tile 일치를 요구한다. unrelated CORE 결과로 rho를 덮어쓰면 안 된다.
+- `core_last`의 중간 phase 의미를 ACT16 command-last와 구분한다. AFFINE feature127은 모든
+  tile에서 tile-last지만, 마지막 tile에서만 command-last다. 중간 z/D/rho/T 결과는 final commit 대상이 아니다.
+- NORM read 후 T overwrite를 하며 같은 주소의 read/write가 같은 cycle에 발생하면 안 된다.
+  반환 데이터에 원래 주소를 붙여 유지하고, overwrite한 z를 다시 읽지 않는다. AFFINE은 모든 T write
+  완료 뒤 시작한다. TB의 `tile*128+feature`는 설명용 주소이며 production scratch 배치를 확정하지 않는다.
+- common은 N=128을 LN 전용으로 검사하지 않으므로 실제 wrapper가 LN geometry를 확인해야 한다.
+  tile index 2-bit와 MT count 3-bit, feature index 7-bit와 burst count 8-bit를 구별한다.
+  공통 logical base는 계속 16-bit다. 물리 메모리 용량을 늘린다는 뜻은 아니다.
+
+coefficient page/72-bit parameter ABI, residual read 배선, S3 sideband 정렬, scratch/ACT16 주소와
+실제 numerical CORE 연결은 다음 integration 작업이다. 이 파일들은 production VFU_TOP이 아니다.
+
 ## 실행과 검증 범위
 
 Icarus Verilog 12의 RTL simulation으로 실행한다. repository root에서:
@@ -138,12 +253,17 @@ IVERILOG=/path/to/iverilog VVP=/path/to/vvp IVL_DIR=/path/to/ivl \
   bash tb/vfu/vfu_draft/control/run_control_draft.sh
 ```
 
-runner는 common, Softmax, hierarchy TB를 실행하고 common의 reserved-op/busy-start 오류 검사도 확인한다.
+runner는 common, Softmax, 기존 hierarchy, LN unit 및 LN hierarchy TB를 실행하고
+common의 reserved-op/busy-start 및 LN의 잘못된 MT, clear/capture 충돌, U8 container,
+잘못된 완료/반환 사건 오류 검사도 확인한다.
 기존 RQ/GELU 파일에 timescale이 없어서 Icarus가 inherited-timescale warning을 낼 수 있으며 파일은 그대로 둔다.
 common TB는 9개 명령과 실제 RQ/GELU 4546-beat 입력, 2048-beat count, 설정 유지와 지연 commit을 검사한다.
 Softmax TB는 S=16/32/48/64와 padding 경계, 입력 bubble, MAX/E/L/R 완료 지연, 별도 SM_NL과 R 수명을 검사한다.
-hierarchy TB는 `SM → RQ → SM_NL → LN(stub) → GELU`의 실제 제어 연결을 검사한다.
+기존 hierarchy TB는 `SM → RQ → SM_NL → LN(stub) → GELU`를 그대로 검사한다.
+LN unit TB는 MT=1/4/2/3/4의 5개 명령과 bubble, 각 drain, 최종 완료 순서를 검사한다.
+LN hierarchy TB는 MT=2의 `SM → LN → SM_NL → RQ → GELU`에서 실제 LN controller와 rho helper를
+사용한다. scratch z/T marker, S/Q/D 생존 구간과 rho low-byte packing은 boundary model로 확인한다.
 
 테스트의 scratch write/replay, MAX/R slot, L/E/commit 완료는 **boundary model**이다. MAX/R marker는
 산술 계산값이 아니다. 아직 실제 CORE/NN-LUT 수치 결과, coefficient page, S-pad/state64/ACT16 통합,
-주소 배치, Value transpose commit, PMPU/FIFO 무손실, LN, 합성/200 MHz/보드 동작을 검증하지 않았다.
+주소 배치, Value transpose commit, PMPU/FIFO 무손실, LN 수치 정확도, 합성/200 MHz/보드 동작을 검증하지 않았다.
